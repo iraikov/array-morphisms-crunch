@@ -14,7 +14,7 @@
 
  (author "Ivan Raikov")
 
- (synopsis "Crunch-based BLAS, activation, convolution and optimizer kernels for array-morphisms.")
+ (synopsis "Crunch-based array-morphisms kernels for BLAS, activation, convolution and optimizer.")
 
  (components (extension array-morphisms-crunch-threads
                         (source "crunch-thread-dispatch.scm")
