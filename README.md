@@ -90,7 +90,7 @@ check this with `eqv?`.
 Bindings produced by the element-wise fusion pass keep the consumer's op name
 but carry a composed combiner. They do not use activation kernels.
 
-The backends hold three more kinds of kernel, which array-morphisms uses in
+The backends hold three more kinds of kernels, which array-morphisms uses in
 the same way:
 
 - **Binary ops.** The backend constructors register `add`, `sub`, `mul` and
@@ -263,14 +263,6 @@ Also, crunch requires a type declaration `(: (name argtype ...) rettype)`
 for each exported procedure, and its `+` and `*` take exactly two arguments.
 
 ## Tests
-
-```bash
-CHICKEN_BIN=/path/to/chicken/bin tests/feature/run.sh
-```
-
-```bash
-csi -s tests/run.scm
-```
 
 `tests/feature/` holds standalone checks of the crunch features the egg relies
 on:
