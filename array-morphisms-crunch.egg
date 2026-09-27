@@ -1,0 +1,48 @@
+;;;; -*- Hen -*-
+
+(
+ ; Your egg's license:
+ (license "LGPL-3")
+
+ ; Egg category
+ (category data)
+
+ ; crunch is CHICKEN 6's embedded compiler for a statically typed subset of
+ ; Scheme.  Its (crunch ...) macro generates C during normal compilation of
+ ; each .scm file, so this egg has no separate C sources.
+ (dependencies srfi-4 crunch array-morphisms)
+
+ (author "Ivan Raikov")
+
+ (synopsis "Crunch-based BLAS, activation, convolution and optimizer kernels for array-morphisms.")
+
+ (components (extension array-morphisms-crunch-threads
+                        (source "crunch-thread-dispatch.scm")
+                        (csc-options "-O2" "-d1" "-C" "-O3 -DNDEBUG")
+                        (link-options "-L" "-lpthread"))
+             (extension array-morphisms-crunch-activations
+                        (source "crunch-activation-kernels.scm")
+                        (source-dependencies "crunch-numvector-fix.scm")
+                        (csc-options "-O2" "-d1" "-C" "-O3 -DNDEBUG")
+                        (link-options "-L" "-lpthread")
+                        (component-dependencies array-morphisms-crunch-threads))
+             (extension array-morphisms-crunch-blas-backend
+                        (source "crunch-blas-backend.scm")
+                        (source-dependencies "crunch-numvector-fix.scm")
+                        (csc-options "-O2" "-d1" "-C" "-O3 -DNDEBUG")
+                        (component-dependencies array-morphisms-crunch-threads))
+             (extension array-morphisms-crunch-optimizers
+                        (source "crunch-optimizer-kernels.scm")
+                        (source-dependencies "crunch-numvector-fix.scm")
+                        (csc-options "-O2" "-d1" "-C" "-O3 -DNDEBUG")
+                        (component-dependencies array-morphisms-crunch-threads))
+             (extension array-morphisms-crunch-conv-backend
+                        (source "crunch-conv-backend.scm")
+                        (source-dependencies "crunch-numvector-fix.scm")
+                        (csc-options "-O2" "-d1" "-C" "-O3 -DNDEBUG")
+                        (component-dependencies array-morphisms-crunch-blas-backend))
+             )
+
+ (test-dependencies test)
+
+)
