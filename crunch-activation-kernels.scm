@@ -241,6 +241,146 @@
      (list 'div (foreign-value "((void *)&am_crunch_div_binary_f32)" c-pointer)
                (foreign-value "((void *)&am_crunch_div_binary_f64)" c-pointer))))
 
+  ;; am_crunch_<op>_bcast_<t> computes rows [start, end) of the broadcast
+  ;; binary op on a row-major output with n columns:
+  ;;   out[i*n + j] = a[i*rsa + j*csa] op b[i*rsb + j*csb]
+  ;; where the steps follow from the operand modes ma and mb (0 full,
+  ;; 1 per row, 2 per column, 3 scalar; see lookup-broadcast-kernel).
+  ;; They follow the calling convention of crunch-dispatch4-f32/-f64 with
+  ;; i0 = n, i1 = ma and i2 = mb.  
+
+  (crunch
+    (: (am_crunch_add_bcast_f32 integer integer integer integer integer
+                                 f64vector f32vector f32vector f32vector f32vector) void)
+    (define (am_crunch_add_bcast_f32 start end n ma mb scal a b out unused)
+      (let ((rsa (if (= ma 0) n (if (= ma 1) 1 0)))
+            (csa (if (= ma 0) 1 (if (= ma 2) 1 0)))
+            (rsb (if (= mb 0) n (if (= mb 1) 1 0)))
+            (csb (if (= mb 0) 1 (if (= mb 2) 1 0))))
+        (do ((i start (+ i 1))) ((= i end))
+          (let ((o (* i n)) (ai (* i rsa)) (bi (* i rsb)))
+            (do ((j 0 (+ j 1))) ((= j n))
+              (f32vector-set! out (+ o j)
+                               (+ (f32vector-ref a (+ ai (* j csa)))
+                                  (f32vector-ref b (+ bi (* j csb)))))))))))
+
+  (crunch
+    (: (am_crunch_add_bcast_f64 integer integer integer integer integer
+                                 f64vector f64vector f64vector f64vector f64vector) void)
+    (define (am_crunch_add_bcast_f64 start end n ma mb scal a b out unused)
+      (let ((rsa (if (= ma 0) n (if (= ma 1) 1 0)))
+            (csa (if (= ma 0) 1 (if (= ma 2) 1 0)))
+            (rsb (if (= mb 0) n (if (= mb 1) 1 0)))
+            (csb (if (= mb 0) 1 (if (= mb 2) 1 0))))
+        (do ((i start (+ i 1))) ((= i end))
+          (let ((o (* i n)) (ai (* i rsa)) (bi (* i rsb)))
+            (do ((j 0 (+ j 1))) ((= j n))
+              (f64vector-set! out (+ o j)
+                               (+ (f64vector-ref a (+ ai (* j csa)))
+                                  (f64vector-ref b (+ bi (* j csb)))))))))))
+
+  (crunch
+    (: (am_crunch_sub_bcast_f32 integer integer integer integer integer
+                                 f64vector f32vector f32vector f32vector f32vector) void)
+    (define (am_crunch_sub_bcast_f32 start end n ma mb scal a b out unused)
+      (let ((rsa (if (= ma 0) n (if (= ma 1) 1 0)))
+            (csa (if (= ma 0) 1 (if (= ma 2) 1 0)))
+            (rsb (if (= mb 0) n (if (= mb 1) 1 0)))
+            (csb (if (= mb 0) 1 (if (= mb 2) 1 0))))
+        (do ((i start (+ i 1))) ((= i end))
+          (let ((o (* i n)) (ai (* i rsa)) (bi (* i rsb)))
+            (do ((j 0 (+ j 1))) ((= j n))
+              (f32vector-set! out (+ o j)
+                               (- (f32vector-ref a (+ ai (* j csa)))
+                                  (f32vector-ref b (+ bi (* j csb)))))))))))
+
+  (crunch
+    (: (am_crunch_sub_bcast_f64 integer integer integer integer integer
+                                 f64vector f64vector f64vector f64vector f64vector) void)
+    (define (am_crunch_sub_bcast_f64 start end n ma mb scal a b out unused)
+      (let ((rsa (if (= ma 0) n (if (= ma 1) 1 0)))
+            (csa (if (= ma 0) 1 (if (= ma 2) 1 0)))
+            (rsb (if (= mb 0) n (if (= mb 1) 1 0)))
+            (csb (if (= mb 0) 1 (if (= mb 2) 1 0))))
+        (do ((i start (+ i 1))) ((= i end))
+          (let ((o (* i n)) (ai (* i rsa)) (bi (* i rsb)))
+            (do ((j 0 (+ j 1))) ((= j n))
+              (f64vector-set! out (+ o j)
+                               (- (f64vector-ref a (+ ai (* j csa)))
+                                  (f64vector-ref b (+ bi (* j csb)))))))))))
+
+  (crunch
+    (: (am_crunch_mul_bcast_f32 integer integer integer integer integer
+                                 f64vector f32vector f32vector f32vector f32vector) void)
+    (define (am_crunch_mul_bcast_f32 start end n ma mb scal a b out unused)
+      (let ((rsa (if (= ma 0) n (if (= ma 1) 1 0)))
+            (csa (if (= ma 0) 1 (if (= ma 2) 1 0)))
+            (rsb (if (= mb 0) n (if (= mb 1) 1 0)))
+            (csb (if (= mb 0) 1 (if (= mb 2) 1 0))))
+        (do ((i start (+ i 1))) ((= i end))
+          (let ((o (* i n)) (ai (* i rsa)) (bi (* i rsb)))
+            (do ((j 0 (+ j 1))) ((= j n))
+              (f32vector-set! out (+ o j)
+                               (* (f32vector-ref a (+ ai (* j csa)))
+                                  (f32vector-ref b (+ bi (* j csb)))))))))))
+
+  (crunch
+    (: (am_crunch_mul_bcast_f64 integer integer integer integer integer
+                                 f64vector f64vector f64vector f64vector f64vector) void)
+    (define (am_crunch_mul_bcast_f64 start end n ma mb scal a b out unused)
+      (let ((rsa (if (= ma 0) n (if (= ma 1) 1 0)))
+            (csa (if (= ma 0) 1 (if (= ma 2) 1 0)))
+            (rsb (if (= mb 0) n (if (= mb 1) 1 0)))
+            (csb (if (= mb 0) 1 (if (= mb 2) 1 0))))
+        (do ((i start (+ i 1))) ((= i end))
+          (let ((o (* i n)) (ai (* i rsa)) (bi (* i rsb)))
+            (do ((j 0 (+ j 1))) ((= j n))
+              (f64vector-set! out (+ o j)
+                               (* (f64vector-ref a (+ ai (* j csa)))
+                                  (f64vector-ref b (+ bi (* j csb)))))))))))
+
+  (crunch
+    (: (am_crunch_div_bcast_f32 integer integer integer integer integer
+                                 f64vector f32vector f32vector f32vector f32vector) void)
+    (define (am_crunch_div_bcast_f32 start end n ma mb scal a b out unused)
+      (let ((rsa (if (= ma 0) n (if (= ma 1) 1 0)))
+            (csa (if (= ma 0) 1 (if (= ma 2) 1 0)))
+            (rsb (if (= mb 0) n (if (= mb 1) 1 0)))
+            (csb (if (= mb 0) 1 (if (= mb 2) 1 0))))
+        (do ((i start (+ i 1))) ((= i end))
+          (let ((o (* i n)) (ai (* i rsa)) (bi (* i rsb)))
+            (do ((j 0 (+ j 1))) ((= j n))
+              (f32vector-set! out (+ o j)
+                               (/ (f32vector-ref a (+ ai (* j csa)))
+                                  (f32vector-ref b (+ bi (* j csb)))))))))))
+
+  (crunch
+    (: (am_crunch_div_bcast_f64 integer integer integer integer integer
+                                 f64vector f64vector f64vector f64vector f64vector) void)
+    (define (am_crunch_div_bcast_f64 start end n ma mb scal a b out unused)
+      (let ((rsa (if (= ma 0) n (if (= ma 1) 1 0)))
+            (csa (if (= ma 0) 1 (if (= ma 2) 1 0)))
+            (rsb (if (= mb 0) n (if (= mb 1) 1 0)))
+            (csb (if (= mb 0) 1 (if (= mb 2) 1 0))))
+        (do ((i start (+ i 1))) ((= i end))
+          (let ((o (* i n)) (ai (* i rsa)) (bi (* i rsb)))
+            (do ((j 0 (+ j 1))) ((= j n))
+              (f64vector-set! out (+ o j)
+                               (/ (f64vector-ref a (+ ai (* j csa)))
+                                  (f64vector-ref b (+ bi (* j csb)))))))))))
+
+  (define %crunch-broadcast-table
+    ;; (op f32-chunk-address f64-chunk-address)
+    (list
+     (list 'add (foreign-value "((void *)&am_crunch_add_bcast_f32)" c-pointer)
+               (foreign-value "((void *)&am_crunch_add_bcast_f64)" c-pointer))
+     (list 'sub (foreign-value "((void *)&am_crunch_sub_bcast_f32)" c-pointer)
+               (foreign-value "((void *)&am_crunch_sub_bcast_f64)" c-pointer))
+     (list 'mul (foreign-value "((void *)&am_crunch_mul_bcast_f32)" c-pointer)
+               (foreign-value "((void *)&am_crunch_mul_bcast_f64)" c-pointer))
+     (list 'div (foreign-value "((void *)&am_crunch_div_bcast_f32)" c-pointer)
+               (foreign-value "((void *)&am_crunch_div_bcast_f64)" c-pointer))))
+
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Reduction kernels
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -512,6 +652,32 @@
           (list f32vector-length f64vector-length)
           (list crunch-dispatch4-f32 crunch-dispatch4-f64))))
      %crunch-binary-table)
+    ;; Broadcast kernels split the rows across threads; min-chunk counts
+    ;; elements, so each thread gets at least min-chunk / cols rows.
+    (for-each
+     (lambda (entry)
+       (let ((op (car entry)))
+         (for-each
+          (lambda (dtype address vec-length dispatch)
+            (activation-backend-add-broadcast-kernel!
+             be op dtype
+             (lambda (rows cols a ma b mb out)
+               (let ((need (lambda (mode)
+                             (case mode
+                               ((0) (* rows cols)) ((1) rows) ((2) cols) ((3) 1)
+                               (else (error op "invalid broadcast mode" mode))))))
+                 (unless (and (fixnum? rows) (fixnum? cols) (> rows 0) (> cols 0)
+                              (<= (* rows cols) (vec-length out))
+                              (<= (need ma) (vec-length a))
+                              (<= (need mb) (vec-length b)))
+                   (error op "broadcast operands do not fit their vectors" rows cols ma mb)))
+               (dispatch rows cols ma mb no-scalars a b out out address (threads)
+                         (max 1 (quotient (min-chunk) cols))))))
+          '(f32 f64)
+          (list (cadr entry) (caddr entry))
+          (list f32vector-length f64vector-length)
+          (list crunch-dispatch4-f32 crunch-dispatch4-f64))))
+     %crunch-broadcast-table)
     (for-each
      (lambda (entry)
        (let ((rop (car entry)) (axis (cadr entry)))

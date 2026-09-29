@@ -350,6 +350,58 @@
     (test-error "binary kernel rejects a size beyond its vectors"
       ((lookup-binary-kernel be 'add 'f32) 10 (make-f32vector 5) (make-f32vector 10) (make-f32vector 10)))))
 
+;; Reference for a broadcast kernel: out[i, j] = f(a[ia], b[ib]) with the
+;; operand indexing of lookup-broadcast-kernel's modes.
+(define (broadcast-index mode i j cols)
+  (case mode ((0) (+ (* i cols) j)) ((1) i) ((2) j) (else 0)))
+
+(define (broadcast-size mode rows cols)
+  (case mode ((0) (* rows cols)) ((1) rows) ((2) cols) (else 1)))
+
+(test-group "crunch kernels - broadcast ops equal the Scheme combiners"
+  (let ((be (make-crunch-threaded-activation-backend)))
+    (for-each
+     (lambda (entry)
+       (let ((op (car entry)) (f (cdr entry)))
+         (for-each
+          (lambda (dtype make ref set)
+            (for-each
+             (lambda (modes)
+               (for-each
+                (lambda (threads)
+                  (test-assert (sprintf "~A ~A, modes ~A, ~A thread(s)" op dtype modes threads)
+                    (parameterize ((crunch-thread-count threads)
+                                   (crunch-thread-min-chunk 1000))
+                      (let* ((rows 301) (cols 67)
+                             (ma (car modes)) (mb (cadr modes))
+                             (a (values-vector make (broadcast-size ma rows cols)))
+                             (b (let ((v (values-vector make (+ 5 (broadcast-size mb rows cols))))
+                                      (w (make (broadcast-size mb rows cols))))
+                                  (do ((i 0 (+ i 1))) ((= i (broadcast-size mb rows cols)) w)
+                                    (set w i (ref v (+ i 5))))))
+                             (out (make (* rows cols)))
+                             (expected (make (* rows cols))))
+                        ((lookup-broadcast-kernel be op dtype) rows cols a ma b mb out)
+                        (do ((i 0 (+ i 1))) ((= i rows))
+                          (do ((j 0 (+ j 1))) ((= j cols))
+                            (set expected (+ (* i cols) j)
+                                 (f (ref a (broadcast-index ma i j cols))
+                                    (ref b (broadcast-index mb i j cols))))))
+                        (same-lists? (srfi4->list out) (srfi4->list expected))))))
+                '(1 8)))
+             '((0 1) (0 2) (0 3) (1 0) (2 0) (3 0) (1 2) (2 1) (3 1))))
+          '(f32 f64)
+          (list make-f32vector make-f64vector)
+          (list f32vector-ref f64vector-ref)
+          (list f32vector-set! f64vector-set!))))
+     binary-combiners)
+    (test-error "broadcast kernel rejects an operand shorter than its mode needs"
+      ((lookup-broadcast-kernel be 'add 'f32) 10 4 (make-f32vector 40) 0
+       (make-f32vector 3) 1 (make-f32vector 40)))
+    (test-error "broadcast kernel rejects an unknown mode"
+      ((lookup-broadcast-kernel be 'mul 'f64) 2 2 (make-f64vector 4) 0
+       (make-f64vector 4) 7 (make-f64vector 4)))))
+
 (test-group "crunch kernels - reductions equal the Scheme fast path"
   (for-each
    (lambda (rop)

@@ -10,7 +10,7 @@
  ; crunch is CHICKEN 6's embedded compiler for a statically typed subset of
  ; Scheme.  Its (crunch ...) macro generates C during normal compilation of
  ; each .scm file, so this egg has no separate C sources.
- (dependencies srfi-4 crunch array-morphisms)
+ (dependencies crunch array-morphisms)
 
  (author "Ivan Raikov")
 
