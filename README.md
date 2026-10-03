@@ -13,7 +13,7 @@ in their inner loops.
 
 | Module | Contents |
 |---|---|
-| `array-morphisms-crunch-activations` | f32/f64 kernels for `relu`, `sigmoid`, `tanh` and their SSA derivative ops; binary kernels for `add`, `sub`, `mul`, `div`; axis-0 and axis-1 reductions (`sum`, `mean`, `max`, `min`); a strided copy; `make-crunch-activation-backend` and `make-crunch-threaded-activation-backend` |
+| `array-morphisms-crunch-activations` | f32/f64 kernels for `relu`, `sigmoid`, `tanh` and their SSA derivative ops, and for `exp`, `log`, `sqrt`, `negate`, `abs`; row softmax (`crunch-softmax-rows-f32`/`-f64`) and interleaved rotary embedding (`crunch-rope-f32`/`-f64`); binary kernels for `add`, `sub`, `mul`, `div`; axis-0 and axis-1 reductions (`sum`, `mean`, `max`, `min`); a strided copy; `make-crunch-activation-backend` and `make-crunch-threaded-activation-backend` |
 | `array-morphisms-crunch-threads` | the POSIX-thread dispatchers for chunk kernels (`crunch-dispatch-f32`, `crunch-dispatch-f64`, `crunch-dispatch4-f32`, `crunch-dispatch4-f64`) and their settings |
 | `array-morphisms-crunch-blas-backend` | `crunch-{s,d}gemm`, `-gemm-strided`, `-gemv`, `-dot`, `-axpy` with the normalized signatures of `array-morphisms-blas-exec`; `crunch-native-build?` |
 | `array-morphisms-crunch-conv-backend` | NCHW/NHWC `im2col`, `col2im`, `bias-add`, the six convolution hooks, and `make-crunch-blas-backend` (the complete `blas-backend` record) |
@@ -143,6 +143,37 @@ Each derivative is its own unary op, because `ssa-vjp` chooses its input:
 `relu-deriv` reads the forward input, while `sigmoid-deriv` and `tanh-deriv`
 read the forward output. A derivative that needs two arrays, such as that of
 swish (the input and an intermediate), cannot be expressed as a table entry.
+
+## Unary math kernels
+
+The table also has entries for `exp`, `log`, `sqrt`, `negate` and `abs`.
+These names are the op names that `morph-exp`, `morph-log`, `morph-sqrt`,
+`morph-negate` and `morph-abs` give their nodes, so once the backend is
+registered the replay compiler runs these ops in compiled SSA programs with
+the crunch kernels. Their results are bit-identical to the Scheme
+combiners, except that `log` and `sqrt` of a negative number give NaN where
+Scheme gives a complex number, which an f32 or f64 array cannot hold.
+
+## Row softmax and rotary embedding
+
+These kernels have no morphism op. They are called directly, on
+preallocated vectors, by code that works outside compiled SSA programs,
+such as attention over a key/value cache whose length grows with each
+token.
+
+- `(crunch-softmax-rows-f32 rows cols src out)` replaces each row of the
+  row-major `rows` x `cols` array `src` by its softmax and stores it in
+  `out`, which may be `src`. The row maximum is subtracted before `exp`, so
+  large inputs do not overflow; the sum is accumulated in double precision.
+- `(crunch-rope-f32 n head-size base cos sin x)` rotates the first `n`
+  elements of `x` in place as consecutive pairs `(x[i], x[i+1])`. Pair `p`
+  of each head of `head-size` elements is rotated by the angle with cosine
+  `cos[base + p]` and sine `sin[base + p]`. This is the interleaved rotary
+  position embedding of Llama, with `base` selecting the table row of the
+  token position.
+
+The `-f64` variants take f64vectors. Both kernels check their arguments
+against the vector lengths and raise an error when they do not fit.
 
 ## Threaded activation kernels
 

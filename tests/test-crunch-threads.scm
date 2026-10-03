@@ -41,7 +41,8 @@
 (define (th-same-lists? a b)
   (and (= (length a) (length b)) (every th-same? a b)))
 
-(define th-ops '(relu sigmoid tanh relu-deriv sigmoid-deriv tanh-deriv))
+(define th-ops '(relu sigmoid tanh relu-deriv sigmoid-deriv tanh-deriv
+                 exp negate abs))
 
 ;; Special values first, then a deterministic spread covering both signs,
 ;; small and large magnitudes, and exp overflow.
@@ -86,7 +87,10 @@
                  (if (< x 0.0) (- t) t))))
     (relu-deriv . ,(lambda (x) (if (> x 0.0) 1.0 0.0)))
     (sigmoid-deriv . ,(lambda (s) (* s (- 1.0 s))))
-    (tanh-deriv . ,(lambda (t) (- 1.0 (* t t))))))
+    (tanh-deriv . ,(lambda (t) (- 1.0 (* t t))))
+    (exp . ,exp)
+    (negate . ,(lambda (x) (- x)))
+    (abs . ,abs)))
 
 (define (combiner-result op dtype in n)
   (let ((out (th-make dtype n 0.0)))

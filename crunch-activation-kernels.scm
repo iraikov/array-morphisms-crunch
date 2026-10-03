@@ -11,12 +11,15 @@
 ;;; kernels read single floats, compute in double and round on store, which
 ;;; is exactly what the Scheme fallback does.
 ;;;
-;;; The formulas below are those of basic-ops.scm (relu, sigmoid, tanh) and
+;;; The formulas below are those of basic-ops.scm (relu, sigmoid, tanh, and
+;;; the unary math ops exp, log, sqrt, negate and abs) and
 ;;; of the derivative maps emitted by ssa-vjp (relu-deriv, sigmoid-deriv,
 ;;; tanh-deriv), written the same way, so that each kernel gives the same
 ;;; floating-point result as the combiner it replaces.  relu is written as a
 ;;; comparison rather than max: (if (> v 0.0) v 0.0) gives 0.0 for NaN and
-;;; -0.0, as CHICKEN's (max 0.0 v) does.  tanh is computed from
+;;; -0.0, as CHICKEN's (max 0.0 v) does.  negate is written as (* -1.0 x),
+;;; which gives -0.0 for 0.0 as (- x) does.  log and sqrt of a negative
+;;; number give NaN, where the Scheme combiners return a complex number.  tanh is computed from
 ;;; e = exp(-2|x|), which cannot overflow, so large |x| gives +-1.0.
 ;;; Entries must use fpabs rather than abs: crunch 0.992 compiles abs on a
 ;;; float to C's integer abs(), which truncates its argument.
@@ -52,6 +55,11 @@
 ;;; or, to split large arrays across threads (see crunch-thread-dispatch.scm):
 ;;;
 ;;;   (register-activation-backend! (make-crunch-threaded-activation-backend))
+;;;
+;;; The module also exports two kernels with no morphism op, called
+;;; directly on preallocated vectors: crunch-softmax-rows-<t>, a row-wise
+;;; softmax, and crunch-rope-<t>, the interleaved rotary position
+;;; embedding of Llama.
 
 (module array-morphisms-crunch-activations
 
@@ -66,7 +74,16 @@
    crunch-tanh-f32          crunch-tanh-f64
    crunch-relu-deriv-f32    crunch-relu-deriv-f64
    crunch-sigmoid-deriv-f32 crunch-sigmoid-deriv-f64
-   crunch-tanh-deriv-f32    crunch-tanh-deriv-f64)
+   crunch-tanh-deriv-f32    crunch-tanh-deriv-f64
+   crunch-exp-f32           crunch-exp-f64
+   crunch-log-f32           crunch-log-f64
+   crunch-sqrt-f32          crunch-sqrt-f64
+   crunch-negate-f32        crunch-negate-f64
+   crunch-abs-f32           crunch-abs-f64
+
+   ;; Row and rotation kernels, with argument checking.
+   crunch-softmax-rows-f32  crunch-softmax-rows-f64
+   crunch-rope-f32          crunch-rope-f64)
 
   (import scheme (chicken base) (chicken foreign) (chicken flonum)
           (chicken number-vector) crunch)
@@ -161,7 +178,120 @@
                              (if (< x 0.0) (- t) t)))
     (relu-deriv    (x) (if (> x 0.0) 1.0 0.0))
     (sigmoid-deriv (s) (* s (- 1.0 s)))
-    (tanh-deriv    (t) (- 1.0 (* t t))))
+    (tanh-deriv    (t) (- 1.0 (* t t)))
+    (exp           (x) (exp x))
+    (log           (x) (log x))
+    (sqrt          (x) (sqrt x))
+    (negate        (x) (* -1.0 x))
+    (abs           (x) (fpabs x)))
+
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; Row softmax
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  ;; %k-softmax-rows-<t> replaces each row of a row-major rows x cols array
+  ;; src by its softmax, exp(x - max) / sum exp(x - max), and stores it in
+  ;; out, which may be src.  Subtracting the row maximum keeps exp from
+  ;; overflowing.  The sum is accumulated in double precision.
+
+  (crunch
+    (: (%k-softmax-rows-f32 integer integer f32vector f32vector) void)
+    (define (%k-softmax-rows-f32 rows cols src out)
+      (do ((r 0 (+ r 1))) ((= r rows))
+        (let ((base (* r cols))
+              (m (f32vector-ref src (* r cols)))
+              (sum 0.0))
+          (do ((j 1 (+ j 1))) ((= j cols))
+            (let ((x (f32vector-ref src (+ base j))))
+              (when (> x m) (set! m x))))
+          (do ((j 0 (+ j 1))) ((= j cols))
+            (let ((e (exp (- (f32vector-ref src (+ base j)) m))))
+              (f32vector-set! out (+ base j) e)
+              (set! sum (+ sum e))))
+          (let ((scale (/ 1.0 sum)))
+            (do ((j 0 (+ j 1))) ((= j cols))
+              (f32vector-set! out (+ base j) (* scale (f32vector-ref out (+ base j))))))))))
+
+  (crunch
+    (: (%k-softmax-rows-f64 integer integer f64vector f64vector) void)
+    (define (%k-softmax-rows-f64 rows cols src out)
+      (do ((r 0 (+ r 1))) ((= r rows))
+        (let ((base (* r cols))
+              (m (f64vector-ref src (* r cols)))
+              (sum 0.0))
+          (do ((j 1 (+ j 1))) ((= j cols))
+            (let ((x (f64vector-ref src (+ base j))))
+              (when (> x m) (set! m x))))
+          (do ((j 0 (+ j 1))) ((= j cols))
+            (let ((e (exp (- (f64vector-ref src (+ base j)) m))))
+              (f64vector-set! out (+ base j) e)
+              (set! sum (+ sum e))))
+          (let ((scale (/ 1.0 sum)))
+            (do ((j 0 (+ j 1))) ((= j cols))
+              (f64vector-set! out (+ base j) (* scale (f64vector-ref out (+ base j))))))))))
+
+  (define (checked-softmax-rows who kernel vec-length)
+    (lambda (rows cols src out)
+      (unless (and (fixnum? rows) (fixnum? cols) (>= rows 0) (> cols 0)
+                   (<= (* rows cols) (vec-length src))
+                   (<= (* rows cols) (vec-length out)))
+        (error who "array does not fit its vectors" rows cols))
+      (kernel rows cols src out)))
+
+  (define crunch-softmax-rows-f32
+    (checked-softmax-rows 'crunch-softmax-rows-f32 %k-softmax-rows-f32 f32vector-length))
+  (define crunch-softmax-rows-f64
+    (checked-softmax-rows 'crunch-softmax-rows-f64 %k-softmax-rows-f64 f64vector-length))
+
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; Rotary position embedding
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  ;; %k-rope-<t> rotates the first n elements of x in place, taken as
+  ;; consecutive pairs (x[i], x[i+1]) for even i.  The vector is divided
+  ;; into heads of head-size elements, and pair p of each head is rotated
+  ;; by the angle whose cosine and sine are cos[base + p] and sin[base + p]:
+  ;;   x[i]   := x[i] c - x[i+1] s
+  ;;   x[i+1] := x[i] s + x[i+1] c
+  ;; This is the interleaved rotary embedding of Llama, where base selects
+  ;; the row of the cosine and sine tables for the token position.
+
+  (crunch
+    (: (%k-rope-f32 integer integer integer f32vector f32vector f32vector) void)
+    (define (%k-rope-f32 n head-size base cos-t sin-t x)
+      (do ((i 0 (+ i 2))) ((>= i n))
+        (let* ((p (+ base (quotient (remainder i head-size) 2)))
+               (c (f32vector-ref cos-t p))
+               (s (f32vector-ref sin-t p))
+               (x0 (f32vector-ref x i))
+               (x1 (f32vector-ref x (+ i 1))))
+          (f32vector-set! x i (- (* x0 c) (* x1 s)))
+          (f32vector-set! x (+ i 1) (+ (* x0 s) (* x1 c)))))))
+
+  (crunch
+    (: (%k-rope-f64 integer integer integer f64vector f64vector f64vector) void)
+    (define (%k-rope-f64 n head-size base cos-t sin-t x)
+      (do ((i 0 (+ i 2))) ((>= i n))
+        (let* ((p (+ base (quotient (remainder i head-size) 2)))
+               (c (f64vector-ref cos-t p))
+               (s (f64vector-ref sin-t p))
+               (x0 (f64vector-ref x i))
+               (x1 (f64vector-ref x (+ i 1))))
+          (f64vector-set! x i (- (* x0 c) (* x1 s)))
+          (f64vector-set! x (+ i 1) (+ (* x0 s) (* x1 c)))))))
+
+  (define (checked-rope who kernel vec-length)
+    (lambda (n head-size base cos-t sin-t x)
+      (unless (and (fixnum? n) (fixnum? head-size) (fixnum? base)
+                   (>= n 0) (even? n) (> head-size 0) (even? head-size) (>= base 0)
+                   (<= n (vec-length x))
+                   (<= (+ base (quotient (min n head-size) 2)) (vec-length cos-t))
+                   (<= (+ base (quotient (min n head-size) 2)) (vec-length sin-t)))
+        (error who "arguments do not fit their vectors" n head-size base))
+      (kernel n head-size base cos-t sin-t x)))
+
+  (define crunch-rope-f32 (checked-rope 'crunch-rope-f32 %k-rope-f32 f32vector-length))
+  (define crunch-rope-f64 (checked-rope 'crunch-rope-f64 %k-rope-f64 f64vector-length))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Binary element-wise kernels

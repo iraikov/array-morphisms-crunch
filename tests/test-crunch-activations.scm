@@ -15,7 +15,7 @@
 
 (import scheme (chicken base)
         test
-        (only srfi-1 iota every filter-map)
+        (only srfi-1 iota every any filter-map)
         srfi-4
         datatype
         array-morphisms-core
@@ -93,14 +93,15 @@
 ;;; Group 1 - Backend construction
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define all-ops '(relu sigmoid tanh relu-deriv sigmoid-deriv tanh-deriv))
+(define all-ops '(relu sigmoid tanh relu-deriv sigmoid-deriv tanh-deriv
+                  exp log sqrt negate abs))
 
 (test-group "crunch activations - Backend construction"
   (test-assert "make-crunch-activation-backend returns an activation backend"
     (activation-backend? (make-crunch-activation-backend)))
   (test "the backend is named crunch"
     'crunch (activation-backend-name (make-crunch-activation-backend)))
-  (test "crunch-activation-ops lists the six default activation ops"
+  (test "crunch-activation-ops lists the default activation ops"
     all-ops (crunch-activation-ops))
   (test-assert "every op has an f32 and an f64 kernel"
     (let ((be (make-crunch-activation-backend)))
@@ -144,6 +145,40 @@
     (let ((out64 (kernel-values crunch-relu-f64 '(-0.0 +nan.0) 'f64))
           (out32 (kernel-values crunch-relu-f32 '(-0.0 +nan.0) 'f32)))
       (map (lambda (v) (eqv? v 0.0)) (append out64 out32)))))
+
+;; log and sqrt are compared only on their domain, x >= 0 (and NaN):
+;; for negative x the Scheme fallback returns a complex number, which an
+;; f32 or f64 array cannot hold, while the kernels return NaN.
+(define nonnegative-inputs
+  (list 0.0 -0.0 1e-300 0.25 0.5 1.0 2.0 20.0 88.0 400.0 710.0 1e300 +inf.0 +nan.0))
+
+(test-group "crunch activations - unary math kernels equal basic-ops combiners"
+  (for-each
+   (lambda (dtype)
+     (for-each
+      (lambda (entry)
+        (let ((op (car entry)) (morph-op (cadr entry)) (inputs (caddr entry))
+              (raw (if (eq? dtype 'f32) (cadddr entry) (car (cddddr entry)))))
+          (test-assert (string-append (symbol->string op) " " (symbol->string dtype)
+                                      ": backend kernel")
+            (same-lists? (kernel-values (backend-kernel op dtype) inputs dtype)
+                         (fallback-values morph-op inputs dtype)))
+          (test-assert (string-append (symbol->string op) " " (symbol->string dtype)
+                                      ": raw kernel")
+            (same-lists? (kernel-values raw inputs dtype)
+                         (fallback-values morph-op inputs dtype)))))
+      `((exp    ,morph-exp    ,activation-inputs  ,crunch-exp-f32    ,crunch-exp-f64)
+        (log    ,morph-log    ,nonnegative-inputs ,crunch-log-f32    ,crunch-log-f64)
+        (sqrt   ,morph-sqrt   ,nonnegative-inputs ,crunch-sqrt-f32   ,crunch-sqrt-f64)
+        (negate ,morph-negate ,activation-inputs  ,crunch-negate-f32 ,crunch-negate-f64)
+        (abs    ,morph-abs    ,activation-inputs  ,crunch-abs-f32    ,crunch-abs-f64))))
+   '(f64 f32))
+
+  (test-assert "log and sqrt of a negative number are NaN"
+    (every nan? (append (kernel-values crunch-log-f64 '(-1.0) 'f64)
+                        (kernel-values crunch-sqrt-f64 '(-1.0) 'f64)
+                        (kernel-values crunch-log-f32 '(-1.0) 'f32)
+                        (kernel-values crunch-sqrt-f32 '(-1.0) 'f32)))))
 
 (test-group "crunch activations - derivative kernels equal ssa-vjp maps"
   (for-each
@@ -294,6 +329,136 @@
                                                              #(5) 'f64) #t)))
                        (values (am:var-mean (am:var-relu xv)) (list xv)))))))
       (same-lists? (cadr with) '(0.0 0.0 0.0 0.2 0.2)))))
+
+;; morph-exp, which basic-ops builds as an 'exp node, is routed to the
+;; crunch exp kernel by the replay compiler once the backend is registered.
+(define (replay-forward m)
+  (let ((prog (morphism-to-ssa (am:make-var m #f)))
+        (ctx  (make-morphism-context)))
+    (ssa-realize/ctx ctx prog)
+    (finalize-context! ctx)
+    (reset-context! ctx)
+    (ssa-realize/ctx ctx prog)
+    (reset-context! ctx)
+    (let ((result (array-values (car (ssa-realize/ctx ctx prog)))))
+      (values prog result))))
+
+(test-group "crunch activations - SSA replay of unary math ops"
+  (for-each
+   (lambda (dtype)
+     (let ((build (lambda ()
+                    (let ((x (morph-from-list '(-2.0 -0.5 0.0 0.5 3.0) #(5) dtype)))
+                      (morph-sqrt (morph-abs (morph-exp (morph-negate x))))))))
+       (register-activation-backend! #f)
+       (let-values (((p0 without) (replay-forward (build))))
+         (register-activation-backend! (make-crunch-activation-backend))
+         (let-values (((p1 with) (replay-forward (build))))
+           (register-activation-backend! #f)
+           (test (string-append "sqrt(abs(exp(-x))) " (symbol->string dtype)
+                                ": four activation instructions")
+             4 (activation-instruction-count p1))
+           (test-assert (string-append "sqrt(abs(exp(-x))) " (symbol->string dtype)
+                                       ": identical with and without crunch")
+             (same-lists? without with))))))
+   '(f64 f32)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Row softmax and rotary embedding
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Scheme references computing the same operations in the same order as
+;; the kernels, storing into a vector of the same type, so that results
+;; can be compared exactly.
+(define (vref v i) (if (f32vector? v) (f32vector-ref v i) (f64vector-ref v i)))
+(define (vset! v i x) (if (f32vector? v) (f32vector-set! v i x) (f64vector-set! v i x)))
+
+(define (softmax-rows-reference rows cols src out)
+  (do ((r 0 (+ r 1))) ((= r rows))
+    (let* ((base (* r cols))
+           (m (let loop ((j 1) (m (vref src base)))
+                (if (= j cols) m (loop (+ j 1) (max m (vref src (+ base j))))))))
+      (let ((sum (let loop ((j 0) (sum 0.0))
+                   (if (= j cols)
+                       sum
+                       (let ((e (exp (- (vref src (+ base j)) m))))
+                         (vset! out (+ base j) e)
+                         (loop (+ j 1) (+ sum e)))))))
+        (let ((scale (/ 1.0 sum)))
+          (do ((j 0 (+ j 1))) ((= j cols))
+            (vset! out (+ base j) (* scale (vref out (+ base j))))))))))
+
+(define (rope-reference n head-size base cos-t sin-t x)
+  (do ((i 0 (+ i 2))) ((>= i n))
+    (let* ((p (+ base (quotient (remainder i head-size) 2)))
+           (c (vref cos-t p)) (s (vref sin-t p))
+           (x0 (vref x i)) (x1 (vref x (+ i 1))))
+      (vset! x i (- (* x0 c) (* x1 s)))
+      (vset! x (+ i 1) (+ (* x0 s) (* x1 c))))))
+
+(define (v->list v) (if (f32vector? v) (f32vector->list v) (f64vector->list v)))
+
+(define (spread make n f)
+  (let ((v (make n)))
+    (do ((i 0 (+ i 1))) ((= i n) v) (vset! v i (f i)))))
+
+(test-group "crunch kernels - row softmax"
+  (for-each
+   (lambda (dtype make kernel)
+     (let* ((rows 3) (cols 7)
+            (src (spread make (* rows cols) (lambda (i) (* 3.0 (sin (* 1.3 i))))))
+            (out (make (* rows cols)))
+            (ref (make (* rows cols))))
+       (kernel rows cols src out)
+       (softmax-rows-reference rows cols src ref)
+       (test-assert (sprintf "~A: equals the Scheme reference" dtype)
+         (same-lists? (v->list out) (v->list ref)))
+       (test-assert (sprintf "~A: each row sums to 1" dtype)
+         (every (lambda (r)
+                  (< (abs (- 1.0 (let loop ((j 0) (s 0.0))
+                                   (if (= j cols) s
+                                       (loop (+ j 1) (+ s (vref out (+ (* r cols) j))))))))
+                     1e-6))
+                (iota rows)))
+       (test-assert (sprintf "~A: in place" dtype)
+         (begin (kernel rows cols src src)
+                (same-lists? (v->list src) (v->list ref))))
+       (test-assert (sprintf "~A: large inputs do not overflow" dtype)
+         (let ((v (spread make 4 (lambda (i) (+ 1000.0 i)))))
+           (kernel 1 4 v v)
+           (not (any nan? (v->list v)))))
+       (test-error (sprintf "~A: rows x cols larger than src is an error" dtype)
+         (kernel 2 4 (make 7) (make 8)))
+       (test-error (sprintf "~A: zero columns is an error" dtype)
+         (kernel 1 0 (make 1) (make 1)))))
+   '(f32 f64)
+   (list (lambda (n) (make-f32vector n 0.0)) (lambda (n) (make-f64vector n 0.0)))
+   (list crunch-softmax-rows-f32 crunch-softmax-rows-f64)))
+
+(test-group "crunch kernels - rotary embedding"
+  (for-each
+   (lambda (dtype make kernel)
+     (let* ((n 12) (head-size 6) (seq 4) (half 3)
+            (cos-t (spread make (* seq half) (lambda (i) (cos (* 0.4 i)))))
+            (sin-t (spread make (* seq half) (lambda (i) (sin (* 0.4 i)))))
+            (x (spread make n (lambda (i) (- (* 0.5 i) 2.0))))
+            (ref (spread make n (lambda (i) (- (* 0.5 i) 2.0)))))
+       (kernel n head-size (* 2 half) cos-t sin-t x)
+       (rope-reference n head-size (* 2 half) cos-t sin-t ref)
+       (test-assert (sprintf "~A: equals the Scheme reference" dtype)
+         (same-lists? (v->list x) (v->list ref)))
+       (test-assert (sprintf "~A: position 0 with angle 0 leaves x unchanged" dtype)
+         (let ((v (spread make n (lambda (i) (* 1.0 i))))
+               (ones (spread make half (lambda (i) 1.0)))
+               (zeros (spread make half (lambda (i) 0.0))))
+           (kernel n head-size 0 ones zeros v)
+           (same-lists? (v->list v) (map exact->inexact (iota n)))))
+       (test-error (sprintf "~A: an odd n is an error" dtype)
+         (kernel 3 head-size 0 cos-t sin-t x))
+       (test-error (sprintf "~A: a base past the tables is an error" dtype)
+         (kernel n head-size (* seq half) cos-t sin-t x))))
+   '(f32 f64)
+   (list (lambda (n) (make-f32vector n 0.0)) (lambda (n) (make-f64vector n 0.0)))
+   (list crunch-rope-f32 crunch-rope-f64)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Binary, reduction and copy kernels
