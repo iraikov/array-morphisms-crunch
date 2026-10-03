@@ -3,26 +3,24 @@
 ;;; activation backend for array-morphisms (see activation-exec.scm in the
 ;;; array-morphisms egg).
 ;;;
-;;; Each activation op is one table entry (op (v) expr): expr computes the
-;;; op's value from one input element v.  The define-crunch-activations
-;;; macro turns every entry into an f32 and an f64 kernel, each a crunch
-;;; procedure (kernel n in out) that stores expr for the first n elements of
-;;; in into out.  crunch computes in double precision throughout, so the f32
+;;; The formula of each activation op is taken, at syntax time, from the
+;;; scalar-op table of array-morphisms (module
+;;; array-morphisms-scalar-ops-table), whose entries (op (v) expr ...) give
+;;; expr computing the op's value from one input element v.  The
+;;; define-crunch-activations macro turns the entry of every op it is given
+;;; into an f32 and an f64 kernel, each a crunch procedure (kernel n in out)
+;;; that stores expr for the first n elements of in into out.  crunch computes in double precision throughout, so the f32
 ;;; kernels read single floats, compute in double and round on store, which
 ;;; is exactly what the Scheme fallback does.
 ;;;
-;;; The formulas below are those of basic-ops.scm (relu, sigmoid, tanh, and
-;;; the unary math ops exp, log, sqrt, negate and abs) and
-;;; of the derivative maps emitted by ssa-vjp (relu-deriv, sigmoid-deriv,
-;;; tanh-deriv), written the same way, so that each kernel gives the same
-;;; floating-point result as the combiner it replaces.  relu is written as a
-;;; comparison rather than max: (if (> v 0.0) v 0.0) gives 0.0 for NaN and
-;;; -0.0, as CHICKEN's (max 0.0 v) does.  negate is written as (* -1.0 x),
-;;; which gives -0.0 for 0.0 as (- x) does.  log and sqrt of a negative
-;;; number give NaN, where the Scheme combiners return a complex number.  tanh is computed from
-;;; e = exp(-2|x|), which cannot overflow, so large |x| gives +-1.0.
-;;; Entries must use fpabs rather than abs: crunch 0.992 compiles abs on a
-;;; float to C's integer abs(), which truncates its argument.
+;;; The same table supplies the Scheme combiners of array-morphisms, so each
+;;; kernel computes the same formula as the combiner it replaces: relu,
+;;; sigmoid and tanh, the unary math ops exp, log, sqrt, negate and abs, and
+;;; the derivative maps emitted by ssa-vjp (relu-deriv, sigmoid-deriv,
+;;; tanh-deriv).  log and sqrt of a negative number give NaN, where the
+;;; Scheme combiners return a complex number.  The table writes fpabs rather
+;;; than abs because crunch 0.992 compiles abs on a float to C's integer
+;;; abs(), which truncates its argument.
 ;;;
 ;;; The derivative entries are separate ops because ssa-vjp emits each
 ;;; derivative as its own unary binding and chooses its input: relu-deriv
@@ -43,7 +41,9 @@
 ;;; a fixed slope must appear as a literal, and each distinct value needs an
 ;;; entry of its own.
 ;;;
-;;; Adding an entry supplies only a fast kernel.  An op still needs a
+;;; Adding an op name to the define-crunch-activations form supplies only a
+;;; fast kernel; the op must already have an entry of one parameter in the
+;;; scalar-op table.  An op still needs a
 ;;; morph-<op> constructor, an ssa-vjp rule and a rebuild-morphism case in
 ;;; array-morphisms before SSA training graphs can contain it, and its name
 ;;; must be registered with register-activation-op! (done here for every
@@ -89,7 +89,7 @@
           (chicken number-vector) crunch)
   (import array-morphisms-activation-exec)
   (import array-morphisms-crunch-threads)
-  (import-for-syntax scheme (chicken base))
+  (import-for-syntax scheme (chicken base) array-morphisms-scalar-ops-table)
 
   (include "crunch-numvector-fix.scm")
 
@@ -97,9 +97,10 @@
   ;;; Kernel generation
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-  ;; (define-crunch-activations (op (v) expr) ...)
+  ;; (define-crunch-activations op ...)
   ;;
-  ;; For each entry defines crunch-<op>-f32 and crunch-<op>-f64 and the chunk
+  ;; For each op, whose entry (op (v) expr ...) is looked up in the
+  ;; scalar-op table, defines crunch-<op>-f32 and crunch-<op>-f64 and the chunk
   ;; kernels am_crunch_<op>_chunk_f32 and am_crunch_<op>_chunk_f64, and binds
   ;; %crunch-activation-table to a list of
   ;;   (op f32-kernel f64-kernel f32-chunk-address f64-chunk-address).
@@ -142,15 +143,17 @@
                (do ((i 0 (+ i 1))) ((= i n))
                  (let ((,v (,ref in i)))
                    (,set out i ,expr)))))))
-       (let ((entries (cdr form)))
-         (for-each
-          (lambda (e)
-            (unless (and (list? e) (= (length e) 3) (symbol? (car e))
-                         (list? (cadr e)) (= (length (cadr e)) 1)
-                         (symbol? (car (cadr e))))
-              (error 'define-crunch-activations
-                     "entry must have the form (op (v) expr)" e)))
-          entries)
+       (let ((entries
+              (map (lambda (op)
+                     (let ((e (assq op scalar-ops-table)))
+                       (unless e
+                         (error 'define-crunch-activations "no scalar-op table entry for" op))
+                       (unless (and (list? (cadr e)) (= (length (cadr e)) 1)
+                                    (symbol? (car (cadr e))))
+                         (error 'define-crunch-activations
+                                "the table entry must have one parameter" e))
+                       (list (car e) (cadr e) (caddr e))))
+                   (cdr form))))
          `(,(r 'begin)
            ,@(apply append
                     (map (lambda (e)
@@ -171,19 +174,8 @@
                     entries))))))))
 
   (define-crunch-activations
-    (relu          (x) (if (> x 0.0) x 0.0))
-    (sigmoid       (x) (/ 1.0 (+ 1.0 (exp (- x)))))
-    (tanh          (x) (let* ((e (exp (* -2.0 (fpabs x))))
-                                  (t (/ (- 1.0 e) (+ 1.0 e))))
-                             (if (< x 0.0) (- t) t)))
-    (relu-deriv    (x) (if (> x 0.0) 1.0 0.0))
-    (sigmoid-deriv (s) (* s (- 1.0 s)))
-    (tanh-deriv    (t) (- 1.0 (* t t)))
-    (exp           (x) (exp x))
-    (log           (x) (log x))
-    (sqrt          (x) (sqrt x))
-    (negate        (x) (* -1.0 x))
-    (abs           (x) (fpabs x)))
+    relu sigmoid tanh relu-deriv sigmoid-deriv tanh-deriv
+    exp log sqrt negate abs)
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Row softmax

@@ -278,7 +278,7 @@
         (values joint (map array-values results))))))
 
 (define (activation-instruction-count joint)
-  (let ((p (assq 'ri-activation-unary
+  (let ((p (assq 'segop/activation-unary
                  (cdr (assq 'counts (replay-plan-stats joint))))))
     (if p (cdr p) 0)))
 

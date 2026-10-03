@@ -74,29 +74,33 @@ they still do not depend on the number of threads.
 
 ## How activation kernels are used
 
-When the SSA replay plan is compiled, a unary element-wise binding whose op
-is a registered activation op becomes a `ri-activation-unary` instruction.
-At execution time that instruction asks the active activation backend for a
-kernel for its op and dtype, and processes the whole array in one call. If
-no backend is registered, if the dtypes differ, or if the dtype is not f32 or
-f64, the instruction applies the op's Scheme combiner per element instead,
-as `ri-flat-unary` does.
+When the SSA replay plan is compiled, each element-wise binding is lowered
+to a segop (an `ri-segop` instruction of array-morphisms). A unary binding
+whose body is a registered activation op applied to a row-major input of
+the output's shape gets the `segop/activation-unary` executor. At execution
+time that executor asks the active activation backend for a kernel for its
+op and dtype, and processes the whole array in one call. If no backend is
+registered, if the dtypes differ, or if the dtype is not f32 or f64, the
+executor applies the op's Scheme combiner per element instead, as the
+`segop/flat-unary` executor does.
 
-The kernels use the same formulas as the combiners they replace. crunch
-computes in double precision, like the Scheme fallback, so results are
-bit-identical, including for signed zeros, infinities and NaN. The tests
-check this with `eqv?`.
+The kernels are generated from the scalar-op table of array-morphisms
+(`scalar-ops-table.scm`), which also supplies the Scheme combiners, so each
+kernel uses the same formula as the combiner it replaces. crunch computes in
+double precision, like the Scheme fallback, so results are bit-identical,
+including for signed zeros, infinities and NaN. The tests check this with
+`eqv?`.
 
-Bindings produced by the element-wise fusion pass keep the consumer's op name
-but carry a composed combiner. They do not use activation kernels.
+Bindings produced by the element-wise fusion pass have a composed body
+rather than a single op. They do not use activation kernels.
 
 The backends hold three more kinds of kernels, which array-morphisms uses in
 the same way:
 
 - **Binary ops.** The backend constructors register `add`, `sub`, `mul` and
   `div` with `register-binary-op!`, so that element-wise bindings with these
-  ops and two row-major operands of the output's shape compile to
-  `ri-activation-binary` instead of `ri-flat-binary`. The threaded backend
+  ops and two row-major operands of the output's shape get the
+  `segop/activation-binary` executor instead of `segop/flat-binary`. The threaded backend
   splits these kernels across threads like the activations.
 - **Reductions.** `execute-reduction-morphism` uses a reduction kernel for a
   row-major 2-D array reduced over axis 0 or 1. Each kernel rounds exactly
