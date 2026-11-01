@@ -1,17 +1,19 @@
 ;;; crunch-activation-kernels.scm
+;;;
 ;;; Whole-array activation kernels compiled to C by crunch, packaged as an
 ;;; activation backend for array-morphisms (see activation-exec.scm in the
 ;;; array-morphisms egg).
 ;;;
-;;; The formula of each activation op is taken, at syntax time, from the
-;;; scalar-op table of array-morphisms (module
-;;; array-morphisms-scalar-ops-table), whose entries (op (v) expr ...) give
-;;; expr computing the op's value from one input element v.  The
-;;; define-crunch-activations macro turns the entry of every op it is given
-;;; into an f32 and an f64 kernel, each a crunch procedure (kernel n in out)
-;;; that stores expr for the first n elements of in into out.  crunch computes in double precision throughout, so the f32
-;;; kernels read single floats, compute in double and round on store, which
-;;; is exactly what the Scheme fallback does.
+;;; The formula of each activation op is taken, at syntax time, from
+;;; the scalar-op table of array-morphisms (module
+;;; array-morphisms-scalar-ops-table), whose entries (op (v) expr ...)
+;;; give expr computing the op's value from one input element v.  The
+;;; define-crunch-activations macro turns the entry of every op it is
+;;; given into an f32 and an f64 kernel, each a crunch procedure
+;;; (kernel n in out) that stores expr for the first n elements of in
+;;; into out.  crunch computes in double precision throughout, so the
+;;; f32 kernels read single floats, compute in double and round on
+;;; store, which is exactly what the Scheme fallback does.
 ;;;
 ;;; The same table supplies the Scheme combiners of array-morphisms, so each
 ;;; kernel computes the same formula as the combiner it replaces: relu,
@@ -56,6 +58,19 @@
 ;;;
 ;;;   (register-activation-backend! (make-crunch-threaded-activation-backend))
 ;;;
+;;; Fused kernels
+;;;
+;;; The backends also hold fused kernels: each computes a whole segop body
+;;; that combines several table ops, such as g * relu-deriv(x), in one
+;;; pass over its inputs (see define-crunch-fused below).  The fusion pass
+;;; of array-morphisms fuses bindings into such a body only when the
+;;; active backend holds a kernel for it.  A body is written in segop
+;;; syntax, in the canonical form of canonical-scalar-body, with
+;;; (cast f32 e) where the unfused program would store an intermediate f32
+;;; value; the f32 kernel rounds there, and the f64 kernel, whose body has
+;;; no casts, does not round.  So each kernel computes exactly what the
+;;; separate bindings compute.
+;;;
 ;;; The module also exports two kernels with no morphism op, called
 ;;; directly on preallocated vectors: crunch-softmax-rows-<t>, a row-wise
 ;;; softmax, and crunch-rope-<t>, the interleaved rotary position
@@ -67,6 +82,7 @@
    make-crunch-threaded-activation-backend
    crunch-activation-ops
    crunch-activation-chunk-kernel
+   crunch-fused-bodies
 
    ;; Raw kernels: (kernel n in out) -> void, no argument checking.
    crunch-relu-f32          crunch-relu-f64
@@ -86,8 +102,9 @@
    crunch-rope-f32          crunch-rope-f64)
 
   (import scheme (chicken base) (chicken foreign) (chicken flonum)
-          (chicken number-vector) crunch)
+          (chicken number-vector) crunch (crunch c))
   (import array-morphisms-activation-exec)
+  (import (only array-morphisms-segop canonical-scalar-body))
   (import array-morphisms-crunch-threads)
   (import-for-syntax scheme (chicken base) array-morphisms-scalar-ops-table)
 
@@ -755,6 +772,145 @@
   ;; Adds the binary, reduction and strided-copy kernels to be and
   ;; registers the binary op names.  Binary kernels run on up to
   ;; (threads) threads, with at least (min-chunk) elements each.
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; Fused kernels
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  ;; (define-crunch-fused body ...)
+  ;;
+  ;; For each body, a segop body over one to three inputs written for f32
+  ;; (see the module comment), defines an f32 and an f64 chunk kernel in
+  ;; the calling convention of crunch-dispatch4-f32/-f64: v0 ... v(n-1) are
+  ;; the inputs, vn the output, and the remaining vectors and i0-i2 and
+  ;; scal are unused.  Table ops are expanded from their entries in the
+  ;; scalar-op table, (in k) reads element i of input k, and (cast f32 e)
+  ;; rounds e to single precision with a C conversion.  Binds
+  ;; %crunch-fused-table to a list of
+  ;;   (f32-body f64-body n-inputs f32-chunk-address f64-chunk-address).
+  (define-syntax define-crunch-fused
+    (er-macro-transformer
+     (lambda (form r c)
+       (define (strip-casts e)
+         (cond ((not (pair? e)) e)
+               ((eq? (car e) 'cast) (strip-casts (caddr e)))
+               ((eq? (car e) 'in) e)
+               (else (cons (car e) (map strip-casts (cdr e))))))
+       (define (max-input e)
+         (cond ((not (pair? e)) -1)
+               ((eq? (car e) 'in) (cadr e))
+               (else (let loop ((xs (cdr e)) (m -1))
+                       (if (null? xs) m (loop (cdr xs) (max m (max-input (car xs)))))))))
+       (define (vec k) (string->symbol (string-append "%v" (number->string k))))
+       (define (translate e dtype)
+         (let ((ref (if (eq? dtype 'f32) 'f32vector-ref 'f64vector-ref)))
+           (cond ((number? e) (exact->inexact e))
+                 ((not (pair? e)) (error 'define-crunch-fused "unexpected body form" e))
+                 ((eq? (car e) 'in) `(,ref ,(vec (cadr e)) %i))
+                 ((eq? (car e) 'cast)
+                  (unless (and (eq? (cadr e) 'f32) (eq? dtype 'f32))
+                    (error 'define-crunch-fused "only casts to f32, in f32 bodies, are supported" e))
+                  `(am-crunch-round-f32 ,(translate (caddr e) dtype)))
+                 ((assq (car e) scalar-ops-table)
+                  => (lambda (entry)
+                       (let ((params (cadr entry)))
+                         (unless (= (length params) (length (cdr e)))
+                           (error 'define-crunch-fused "wrong number of arguments" e))
+                         `(let ,(map (lambda (p a) (list p (translate a dtype))) params (cdr e))
+                            ,(caddr entry)))))
+                 (else (error 'define-crunch-fused "not a table op" e)))))
+       (define (kernel-name k dtype)
+         (string->symbol (string-append "am_crunch_fused_" (number->string k) "_"
+                                        (symbol->string dtype))))
+       (define (kernel-def k body n dtype)
+         (let ((vt  (if (eq? dtype 'f32) 'f32vector 'f64vector))
+               (set (if (eq? dtype 'f32) 'f32vector-set! 'f64vector-set!)))
+           `((: (,(kernel-name k dtype) integer integer integer integer integer
+                 f64vector ,vt ,vt ,vt ,vt) void)
+             (define (,(kernel-name k dtype) start end i0 i1 i2 scal %v0 %v1 %v2 %v3)
+               (do ((%i start (+ %i 1))) ((= %i end))
+                 (,set ,(vec n) %i ,(translate body dtype)))))))
+       (define (address k dtype)
+         `(,(r 'foreign-value)
+           ,(string-append "((void *)&" (symbol->string (kernel-name k dtype)) ")")
+           ,(r 'c-pointer)))
+       (let* ((bodies (cdr form))
+              (ks     (let loop ((i 0) (bs bodies)) (if (null? bs) '() (cons i (loop (+ i 1) (cdr bs))))))
+              (ns     (map (lambda (b)
+                             (let ((n (+ 1 (max-input b))))
+                               (unless (<= 1 n 3)
+                                 (error 'define-crunch-fused "a body must have one to three inputs" b))
+                               n))
+                           bodies)))
+         `(,(r 'begin)
+           ;; The f32 kernels round through a C conversion.  The egg compiles
+           ;; this module with -fno-semantic-interposition so that the C
+           ;; compiler may inline the conversion into each kernel loop.
+           (,(r 'crunch)
+            (define am-crunch-round-f32 (c-lambda ((float x)) float "return (double)(float)x;"))
+            ,@(apply append (map (lambda (k b n) (kernel-def k b n 'f32)) ks bodies ns)))
+           (,(r 'crunch)
+            ,@(apply append (map (lambda (k b n) (kernel-def k (strip-casts b) n 'f64)) ks bodies ns)))
+           (,(r 'define) %crunch-fused-table
+            (,(r 'list)
+             ,@(map (lambda (k b n)
+                      `(,(r 'list) (,(r 'quote) ,b) (,(r 'quote) ,(strip-casts b)) ,n
+                                   ,(address k 'f32) ,(address k 'f64)))
+                    ks bodies ns))))))))
+
+  ;; The fused bodies, chosen from the bodies the fusion pass forms in the
+  ;; backward passes of convolutional, dense and transformer models:
+  ;; derivatives of the activations times the incoming gradient, x*y + z,
+  ;; the negated product, and exp(-x).
+  (define-crunch-fused
+    (mul (in 0) (cast f32 (relu-deriv (in 1))))
+    (mul (in 0) (cast f32 (sigmoid-deriv (in 1))))
+    (mul (in 0) (cast f32 (tanh-deriv (in 1))))
+    (add (in 0) (cast f32 (mul (in 1) (in 2))))
+    (negate (cast f32 (mul (in 0) (in 1))))
+    (exp (cast f32 (negate (in 0)))))
+
+  (define (crunch-fused-bodies)
+    "The f32 bodies of the fused kernels, in the canonical form under which
+    the backends hold them."
+    (map car %crunch-fused-table))
+
+  ;; Installs the fused kernels of %crunch-fused-table in backend be.  Each
+  ;; kernel is (kernel n ins out); its chunks run on up to (threads)
+  ;; threads, with at least (min-chunk) elements each.
+  (define (add-fused-kernels! be threads min-chunk)
+    (for-each
+     (lambda (entry)
+       (let ((n (caddr entry)))
+         (for-each
+          (lambda (dtype body address vec-length dispatch)
+            (call-with-values (lambda () (canonical-scalar-body body))
+              (lambda (canon perm)
+                (unless (equal? canon body)
+                  (error 'add-fused-kernels! "a fused body is not in canonical form" body))))
+            (activation-backend-add-fused-kernel!
+             be body dtype
+             (lambda (size ins out)
+               (unless (and (fixnum? size) (>= size 0) (= (length ins) n)
+                            (<= size (vec-length out))
+                            (let loop ((vs ins))
+                              (or (null? vs) (and (<= size (vec-length (car vs))) (loop (cdr vs))))))
+                 (error 'fused-kernel "inputs or size do not fit the kernel" body size))
+               (let* ((v0 (car ins))
+                      (v1 (if (> n 1) (cadr ins) out))
+                      (v2 (if (> n 2) (caddr ins) out))
+                      (v3 out))
+                 (if (= n 1)
+                     (dispatch size 0 0 0 no-scalars v0 out out out address (threads) (min-chunk))
+                     (if (= n 2)
+                         (dispatch size 0 0 0 no-scalars v0 v1 out out address (threads) (min-chunk))
+                         (dispatch size 0 0 0 no-scalars v0 v1 v2 v3 address (threads) (min-chunk))))))))
+          '(f32 f64)
+          (list (car entry) (cadr entry))
+          (list (cadddr entry) (car (cddddr entry)))
+          (list f32vector-length f64vector-length)
+          (list crunch-dispatch4-f32 crunch-dispatch4-f64))))
+     %crunch-fused-table))
+
   (define (add-extended-kernels! be threads min-chunk)
     (for-each
      (lambda (entry)
@@ -857,7 +1013,8 @@
     with register-activation-op!.  The backend also holds the binary
     kernels (add, sub, mul, div, whose names it registers with
     register-binary-op!), the axis-0 and axis-1 reduction kernels (sum,
-    mean, max, min) and a strided copy kernel.
+    mean, max, min), a strided copy kernel, and the fused kernels of
+    define-crunch-fused.
 
     Usage:
       (import array-morphisms-crunch-activations)
@@ -873,6 +1030,7 @@
             be op 'f64 (checked-kernel op (caddr entry) f64vector-length))))
        %crunch-activation-table)
       (add-extended-kernels! be (lambda () 1) crunch-thread-min-chunk)
+      (add-fused-kernels! be (lambda () 1) crunch-thread-min-chunk)
       be))
 
   (define (crunch-activation-chunk-kernel op dtype)
@@ -891,8 +1049,8 @@
     split each array across threads with crunch-dispatch-f32 and
     crunch-dispatch-f64, and register each op name with
     register-activation-op!.  Its binary kernels are split across threads in
-    the same way; its reduction and copy kernels are those of
-    make-crunch-activation-backend.  Every call uses the values of
+    the same way, as are its fused kernels; its reduction and copy kernels
+    are those of make-crunch-activation-backend.  Every call uses the values of
     crunch-thread-count and crunch-thread-min-chunk current at that call.
     The results are identical to those of make-crunch-activation-backend.
 
@@ -912,6 +1070,7 @@
             be op 'f64 (lambda (n in out) (crunch-dispatch-f64 n in out chunk-f64)))))
        %crunch-activation-table)
       (add-extended-kernels! be crunch-thread-count crunch-thread-min-chunk)
+      (add-fused-kernels! be crunch-thread-count crunch-thread-min-chunk)
       be))
 
 ) ;; end module array-morphisms-crunch-activations

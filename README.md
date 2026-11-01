@@ -1,13 +1,12 @@
 # array-morphisms-crunch
 
 Activation, element-wise, reduction, BLAS, convolution and optimizer kernels for
-[array-morphisms](../array-morphisms), compiled to C by CHICKEN 6's
+[array-morphisms](../array-morphisms), compiled to C by CHICKEN's
 [crunch](http://wiki.call-cc.org/eggref/6/crunch) embedded compiler.
 
-Crunch compiles a statically typed subset of Scheme to C while the
-surrounding `.scm` file is being compiled. The kernels here are therefore
-written in Scheme, but they run without type dispatch, boxing or allocation
-in their inner loops. 
+Crunch compiles a statically typed subset of Scheme to C. The kernels
+here are therefore written in Scheme, but they run without type
+dispatch, boxing or allocation in their inner loops.
 
 ## Modules
 
@@ -74,15 +73,16 @@ they still do not depend on the number of threads.
 
 ## How activation kernels are used
 
-When the SSA replay plan is compiled, each element-wise binding is lowered
-to a segop (an `ri-segop` instruction of array-morphisms). A unary binding
-whose body is a registered activation op applied to a row-major input of
-the output's shape gets the `segop/activation-unary` executor. At execution
-time that executor asks the active activation backend for a kernel for its
-op and dtype, and processes the whole array in one call. If no backend is
-registered, if the dtypes differ, or if the dtype is not f32 or f64, the
-executor applies the op's Scheme combiner per element instead, as the
-`segop/flat-unary` executor does.
+When the array-morphisms SSA replay plan is compiled, each
+element-wise binding is lowered to a segop (an `ri-segop` instruction
+of array-morphisms). A unary binding whose body is a registered
+activation op applied to a row-major input of the output's shape gets
+the `segop/activation-unary` executor. At execution time that executor
+asks the active activation backend for a kernel for its op and dtype,
+and processes the whole array in one call. If no backend is
+registered, if the dtypes differ, or if the dtype is not f32 or f64,
+the executor applies the op's Scheme combiner per element instead, as
+the `segop/flat-unary` executor does.
 
 The kernels are generated from the scalar-op table of array-morphisms
 (`scalar-ops-table.scm`), which also supplies the Scheme combiners, so each
@@ -157,6 +157,44 @@ registered the replay compiler runs these ops in compiled SSA programs with
 the crunch kernels. Their results are bit-identical to the Scheme
 combiners, except that `log` and `sqrt` of a negative number give NaN where
 Scheme gives a complex number, which an f32 or f64 array cannot hold.
+
+## Fused kernels
+
+Both backends also hold fused kernels. Each fused kernel computes a
+whole segop body of several table ops in one pass over its inputs,
+instead of one kernel per op with an intermediate array between
+them. 
+
+
+| Body | Where the fusion pass forms it |
+|---|---|
+| `(mul (in 0) (cast f32 (relu-deriv (in 1))))` | gradient times relu derivative |
+| `(mul (in 0) (cast f32 (sigmoid-deriv (in 1))))` | gradient times sigmoid derivative |
+| `(mul (in 0) (cast f32 (tanh-deriv (in 1))))` | gradient times tanh derivative |
+| `(add (in 0) (cast f32 (mul (in 1) (in 2))))` | `x*y + z` |
+| `(negate (cast f32 (mul (in 0) (in 1))))` | negated product |
+| `(exp (cast f32 (negate (in 0))))` | `exp(-x)` |
+
+The fusion pass of array-morphisms fuses bindings into one of these bodies
+only when the active backend holds its kernel. It then runs it as
+`segop/fused-kernel`. Without a crunch backend registered, the pass makes
+no such fusion, and plans are unchanged.
+
+- Exact rounding: Each body is written for f32, with `(cast f32 e)`
+  where the unfused program would have stored an intermediate f32 value.
+  The f32 kernel rounds there with a C `(double)(float)` conversion,
+  reached through `c-lambda`. The extension is compiled with
+  `-fno-semantic-interposition`, so that the C compiler inlines that
+  conversion into the kernel loops. The f64 kernel is the same body without
+  casts. 
+- Canonical bodies: Bodies are in the canonical form of
+  `canonical-scalar-body` (array-morphisms `segop.scm`), under which the
+  pass and the replay compiler look kernels up. `crunch-fused-bodies`
+  returns them.
+- Adding a body: Add it to the `define-crunch-fused` form in
+  `crunch-activation-kernels.scm`, in canonical form, with one to three
+  inputs. The bodies the pass forms for a program are listed by
+  `ssa-fusion-pass-stats` (`candidates`) under the fusion policy `'all`.
 
 ## Row softmax and rotary embedding
 

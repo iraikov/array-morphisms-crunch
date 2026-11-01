@@ -15,6 +15,7 @@
 (define test-exit (lambda () (values)))
 
 (include-relative "test-crunch-activations.scm")
+(include-relative "test-crunch-fused.scm")
 (include-relative "test-crunch-blas-backend.scm")
 (include-relative "test-crunch-conv-backend.scm")
 (include-relative "test-crunch-threads.scm")

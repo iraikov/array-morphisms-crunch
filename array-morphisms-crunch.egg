@@ -25,7 +25,7 @@
              (extension array-morphisms-crunch-activations
                         (source "crunch-activation-kernels.scm")
                         (source-dependencies "crunch-numvector-fix.scm")
-                        (csc-options "-O2" "-d1" "-C" "-O3 -DNDEBUG")
+                        (csc-options "-O2" "-d1" "-C" "-O3 -DNDEBUG -fno-semantic-interposition")
                         (link-options "-L" "-lpthread")
                         (component-dependencies array-morphisms-crunch-threads))
              (extension array-morphisms-crunch-blas-backend
