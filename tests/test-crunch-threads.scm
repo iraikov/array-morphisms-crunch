@@ -14,13 +14,19 @@
 ;;;   Group 5 - Settings: parameters, defaults
 ;;;   Group 6 - Argument checking
 ;;;   Group 7 - SSA replay through the threaded backend
+;;;   Group 8 - Thread pool: growth, shutdown, wait paths, fork, signals, GC
 
 (import scheme (chicken base)
         test
         (only srfi-1 iota every filter-map take)
         srfi-4
         (only (chicken number-vector)
-         f32vector->bytevector/shared)
+         f32vector->bytevector/shared f64vector->bytevector/shared
+         subf32vector subf64vector)
+        (only (chicken gc) gc)
+        (only (chicken process) process-fork process-wait process-id process-signal)
+        (only (chicken process signal) set-signal-handler! signal-handler signal/usr1)
+        (only (chicken process-context posix) current-process-id)
         datatype
         array-morphisms-core
         array-morphisms-basic-ops
@@ -30,6 +36,7 @@
         (prefix array-morphisms-grad am:)
         array-morphisms-ssa
         array-morphisms-crunch-activations
+        array-morphisms-crunch-optimizers
         array-morphisms-crunch-threads)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -330,6 +337,271 @@
              (and (= (length without) (length with) 4)
                   (every th-same-lists? without with)))))))
    '(f64 f32)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Group 8 - Thread pool
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Every result is compared byte for byte with a single-threaded
+;; reference through shared bytevector views.
+(define (th-bytes v)
+  (if (f32vector? v) (f32vector->bytevector/shared v) (f64vector->bytevector/shared v)))
+
+(define (th-copy v)
+  (if (f32vector? v) (subf32vector v 0 (f32vector-length v)) (subf64vector v 0 (f64vector-length v))))
+
+(define (th-reference op dtype in n)
+  (let ((o (th-make dtype (max n 1) 0.0)))
+    ((plain-kernel op dtype) n in o)
+    o))
+
+(define (th-expected-threads n threads min-chunk)
+  (max 1 (min threads (quotient n min-chunk) crunch-max-threads)))
+
+(define (th-stat name) (cdr (assq name (crunch-thread-pool-stats))))
+
+;; Adam through crunch-dispatch4-f32: param, grad, m and v of length n,
+;; updated once with the given thread settings; returns the four vectors.
+(define th-adam-hyper (f64vector 0.001 0.9 0.999 1e-8 0.1 0.001 0.01))
+
+(define (th-adam-initial n)
+  (map (lambda (f)
+         (let ((v (make-f32vector n 0.0)))
+           (do ((i 0 (+ i 1))) ((= i n) v) (f32vector-set! v i (f i)))))
+       (list (lambda (i) (sin (* 0.1 i)))
+             (lambda (i) (cos (* 0.3 i)))
+             (lambda (i) (* 0.01 (sin (* 0.7 i))))
+             (lambda (i) (* 0.001 (+ 1.0 (cos (* 0.2 i))))))))
+
+(define (th-adam-run initial n threads min-chunk)
+  (let ((state (map th-copy initial)))
+    (parameterize ((crunch-thread-count threads) (crunch-thread-min-chunk min-chunk))
+      (apply crunch-adam-f32 n th-adam-hyper state))
+    state))
+
+(define (th-adam-same? a b)
+  (every (lambda (x y) (equal? (th-bytes x) (th-bytes y))) a b))
+
+;; Run thunk in a forked child; #t if it returned a true value there.
+;; The child leaves through emergency-exit whatever happens, so that it
+;; never goes on to run the rest of the test file.
+(define (th-in-child thunk)
+  (flush-output)
+  (let ((pid (process-fork
+              (lambda ()
+                (emergency-exit (if (handle-exceptions e #f (thunk)) 0 1))))))
+    (let-values (((p normal? status) (process-wait pid)))
+      (and normal? (= status 0)))))
+
+(define th-initial-spin (crunch-thread-pool-spin-us))
+
+(test-group "crunch threads - pool: results around the chunk thresholds"
+  (for-each
+   (lambda (dtype)
+     (test-assert (string-append "sigmoid " (symbol->string dtype)
+                                 ": T = 1..16, min-chunk 4096, n near multiples of it")
+       (every
+        (lambda (n)
+          (let* ((in  (th-vector dtype n))
+                 (ref (th-bytes (th-reference 'sigmoid dtype in n))))
+            (every
+             (lambda (threads)
+               (let ((out (th-make dtype n -1.0)))
+                 (and (= (dispatch dtype n in out 'sigmoid threads 4096)
+                         (th-expected-threads n threads 4096))
+                      (equal? (th-bytes out) ref))))
+             (iota 16 1))))
+        '(4095 4096 8191 8192 8193 12287 12288 12289 65537))))
+   '(f32 f64)))
+
+(test-group "crunch threads - pool: growth and shutdown"
+  (define in  (th-vector 'f32 1000))
+  (define ref (th-bytes (th-reference 'tanh 'f32 in 1000)))
+  (define (run threads)
+    (let ((out (th-make 'f32 1000 0.0)))
+      (dispatch 'f32 1000 in out 'tanh threads 1)
+      (equal? (th-bytes out) ref)))
+
+  (crunch-thread-pool-shutdown!)
+  (test "empty after shutdown" 0 (crunch-thread-pool-size))
+  (test "shutdown of an empty pool stops nothing" 0 (crunch-thread-pool-shutdown!))
+  (test-assert "a one-thread dispatch creates no worker"
+    (and (run 1) (= 0 (crunch-thread-pool-size))))
+  (test-assert "a one-thread dispatch does not count as a pool dispatch"
+    (let ((d (th-stat 'dispatches)))
+      (run 1)
+      (= d (th-stat 'dispatches))))
+  (test "three threads: two workers" 2 (begin (run 3) (crunch-thread-pool-size)))
+  (test "six threads: five workers" 5 (begin (run 6) (crunch-thread-pool-size)))
+  (test "two threads afterwards: the pool keeps five workers" 5
+        (begin (run 2) (crunch-thread-pool-size)))
+  (test "each threaded dispatch counts once" 3
+        (let ((d (th-stat 'dispatches)))
+          (run 2) (run 1) (run 5) (run 6)
+          (- (th-stat 'dispatches) d)))
+  (test "shutdown stops five workers" 5 (crunch-thread-pool-shutdown!))
+  (test "shutdown again stops none" 0 (crunch-thread-pool-shutdown!))
+  (test-assert "a dispatch after shutdown recreates the pool and is correct"
+    (and (run 4) (= 3 (crunch-thread-pool-size))))
+  (test-assert "the largest thread count gives 63 workers, and results stay correct"
+    (and (run 100) (= 63 (crunch-thread-pool-size)) (run 8) (run 3)))
+  (crunch-thread-pool-shutdown!))
+
+(test-group "crunch threads - pool: spin setting"
+  (test-assert "the spin time is between 0 and 1000000 microseconds"
+    (<= 0 th-initial-spin 1000000))
+  (test "the spin time can be set and read back" '(0 1000)
+        (list (begin (crunch-thread-pool-spin-us-set! 0) (crunch-thread-pool-spin-us))
+              (begin (crunch-thread-pool-spin-us-set! 1000) (crunch-thread-pool-spin-us))))
+  (test-error "a negative spin time is rejected" (crunch-thread-pool-spin-us-set! -1))
+  (test-error "a spin time above 1000000 is rejected" (crunch-thread-pool-spin-us-set! 1000001))
+  (test-error "a non-integer spin time is rejected" (crunch-thread-pool-spin-us-set! 1.5))
+  (crunch-thread-pool-spin-us-set! th-initial-spin))
+
+;; Back-to-back dispatches of three kinds, cycling through sizes and
+;; thread counts: f32 sigmoid, f64 tanh and an f32 Adam step through
+;; crunch-dispatch4-f32.  Returns #t when every result matched its
+;; reference, and the number of calls that used more than one thread.
+(define th-stress-sizes '(1000 4096 5000 20011 65536))
+(define th-stress-min-chunk 1024)
+
+(define th-stress-cases
+  (map (lambda (n)
+         (let ((in32 (th-vector 'f32 n)) (in64 (th-vector 'f64 n))
+               (adam (th-adam-initial n)))
+           (list n
+                 in32 (th-bytes (th-reference 'sigmoid 'f32 in32 n))
+                 in64 (th-bytes (th-reference 'tanh 'f64 in64 n))
+                 adam (th-adam-run adam n 1 1))))
+       th-stress-sizes))
+
+(define (th-stress iterations)
+  (let loop ((k 0) (threaded 0))
+    (if (= k iterations)
+        (values #t threaded)
+        (let* ((c (list-ref th-stress-cases (modulo (quotient k 3) (length th-stress-cases))))
+               (n (car c))
+               (threads (+ 1 (modulo k 8)))
+               (T (th-expected-threads n threads th-stress-min-chunk))
+               (ok (case (modulo k 3)
+                     ((0) (let ((out (th-make 'f32 n 0.0)))
+                            (and (= T (dispatch 'f32 n (list-ref c 1) out 'sigmoid
+                                                threads th-stress-min-chunk))
+                                 (equal? (th-bytes out) (list-ref c 2)))))
+                     ((1) (let ((out (th-make 'f64 n 0.0)))
+                            (and (= T (dispatch 'f64 n (list-ref c 3) out 'tanh
+                                                threads th-stress-min-chunk))
+                                 (equal? (th-bytes out) (list-ref c 4)))))
+                     (else (th-adam-same?
+                            (th-adam-run (list-ref c 5) n threads th-stress-min-chunk)
+                            (list-ref c 6))))))
+          (if ok
+              (loop (+ k 1) (if (> T 1) (+ threaded 1) threaded))
+              (values #f k))))))
+
+(test-group "crunch threads - pool: back-to-back dispatches"
+  (for-each
+   (lambda (spin)
+     (crunch-thread-pool-spin-us-set! spin)
+     (let ((d (th-stat 'dispatches)) (w (th-stat 'wakeups)) (h (th-stat 'spin-hits)))
+       (let-values (((ok threaded) (th-stress 3000)))
+         (let ((label (string-append "spin " (number->string spin) " us: ")))
+           (test-assert (string-append label "3000 mixed dispatches all correct") ok)
+           (test (string-append label "the pool counts each threaded dispatch once")
+                 threaded (- (th-stat 'dispatches) d))
+           (case spin
+             ((0) (test-assert (string-append label "sleeping workers were woken")
+                    (> (th-stat 'wakeups) w)))
+             ((1000) (when (>= (crunch-available-processors) 2)
+                       (test-assert (string-append label "spinning workers found work")
+                         (> (th-stat 'spin-hits) h)))))))))
+   (list 0 th-initial-spin 1000))
+  (crunch-thread-pool-spin-us-set! th-initial-spin)
+  (test-assert "no more workers than the largest request of 8 threads needs"
+    (<= (crunch-thread-pool-size) 7)))
+
+(test-group "crunch threads - pool: fork"
+  (define n 50000)
+  (define in (th-vector 'f32 n))
+  (define ref (th-bytes (th-reference 'sigmoid 'f32 in n)))
+  (define (run threads)
+    (let ((out (th-make 'f32 n 0.0)))
+      (and (= threads (dispatch 'f32 n in out 'sigmoid threads 1))
+           (equal? (th-bytes out) ref))))
+
+  (test-assert "the parent has a pool before the fork"
+    (and (run 8) (= 7 (crunch-thread-pool-size))))
+  (test-assert "the child starts with no workers, then dispatches correctly on 4 threads"
+    (th-in-child
+     (lambda ()
+       (and (= 0 (crunch-thread-pool-size))
+            (run 4)
+            (= 3 (crunch-thread-pool-size))
+            (run 8)
+            (= 7 (crunch-thread-pool-size))))))
+  (test-assert "the child can shut its pool down"
+    (th-in-child (lambda () (and (run 6) (= 5 (crunch-thread-pool-shutdown!))))))
+  (test-assert "the parent's pool is intact after the children exit"
+    (and (= 7 (crunch-thread-pool-size)) (run 8) (run 2))))
+
+;; A forked child sends SIGUSR1 to this process count times, with a
+;; pause between signals, while this process runs threaded dispatches.
+(test-group "crunch threads - pool: signals during dispatch"
+  (define n 200000)
+  (define in (th-vector 'f32 n))
+  (define ref (th-bytes (th-reference 'tanh 'f32 in n)))
+  (define old-handler (signal-handler signal/usr1))
+
+  (for-each
+   (lambda (spin)
+     (crunch-thread-pool-spin-us-set! spin)
+     (let* ((received 0)
+            (parent (current-process-id))
+            (_ (set-signal-handler! signal/usr1
+                                    (lambda (s) (set! received (+ received 1)))))
+            (_ (flush-output))
+            (pid (process-fork
+                  (lambda ()
+                    (emergency-exit
+                     (handle-exceptions e 1
+                       (do ((i 0 (+ i 1))) ((= i 50) 0)
+                         (process-signal parent signal/usr1)
+                         (do ((j 0 (+ j 1))) ((= j 20000))))))))))
+       (let loop ((calls 0) (ok #t))
+         (let-values (((p normal? status) (process-wait pid #t)))
+           (if (and (= p 0) (< calls 100000))
+               (let ((out (th-make 'f32 n 0.0)))
+                 (dispatch 'f32 n in out 'tanh 8 1)
+                 (loop (+ calls 1) (and ok (equal? (th-bytes out) ref))))
+               (let ((label (string-append "spin " (number->string spin) " us: ")))
+                 (test-assert (string-append label "the signalling child exited normally")
+                   (and (= p (process-id pid)) normal? (= status 0)))
+                 (test-assert (string-append label "every dispatch was correct") ok)
+                 (test-assert (string-append label "dispatches ran while signals arrived")
+                   (> calls 0))
+                 (test-assert (string-append label "the handler ran on the CHICKEN thread")
+                   (> received 0))))))))
+   (list 0 th-initial-spin))
+  (set-signal-handler! signal/usr1 old-handler)
+  (crunch-thread-pool-spin-us-set! th-initial-spin))
+
+(test-group "crunch threads - pool: garbage collection between dispatches"
+  (test-assert "500 dispatches on fresh vectors amid garbage and collections"
+    (let* ((n 20011)
+           (in  (th-vector 'f32 n))
+           (ref (th-bytes (th-reference 'sigmoid 'f32 in n))))
+      (let loop ((k 0) (junk '()))
+        (or (= k 500)
+            (let* ((in2 (th-copy in))
+                   (out (th-make 'f32 n -1.0))
+                   (junk (if (= 0 (modulo k 50))
+                             (begin (gc (= 0 (modulo k 100))) '())
+                             (cons (make-vector 100 k) junk))))
+              (dispatch 'f32 n in2 out 'sigmoid (+ 2 (modulo k 7)) 1)
+              (and (equal? (th-bytes out) ref)
+                   (loop (+ k 1) junk))))))))
+
+(crunch-thread-pool-shutdown!)
 
 (register-activation-backend! #f)
 (test-exit)

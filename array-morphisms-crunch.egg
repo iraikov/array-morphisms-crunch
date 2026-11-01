@@ -9,7 +9,8 @@
 
  ; crunch is CHICKEN 6's embedded compiler for a statically typed subset of
  ; Scheme.  Its (crunch ...) macro generates C during normal compilation of
- ; each .scm file, so this egg has no separate C sources.
+ ; each .scm file.  The only separate C source is the thread pool header
+ ; crunch-thread-pool.h, included by crunch-thread-dispatch.scm.
  (dependencies crunch array-morphisms)
 
  (author "Ivan Raikov")
@@ -18,6 +19,7 @@
 
  (components (extension array-morphisms-crunch-threads
                         (source "crunch-thread-dispatch.scm")
+                        (source-dependencies "crunch-thread-pool.h")
                         (csc-options "-O2" "-d1" "-C" "-O3 -DNDEBUG")
                         (link-options "-L" "-lpthread"))
              (extension array-morphisms-crunch-activations

@@ -14,7 +14,7 @@ in their inner loops.
 | Module | Contents |
 |---|---|
 | `array-morphisms-crunch-activations` | f32/f64 kernels for `relu`, `sigmoid`, `tanh` and their SSA derivative ops, and for `exp`, `log`, `sqrt`, `negate`, `abs`; row softmax (`crunch-softmax-rows-f32`/`-f64`) and interleaved rotary embedding (`crunch-rope-f32`/`-f64`); binary kernels for `add`, `sub`, `mul`, `div`; axis-0 and axis-1 reductions (`sum`, `mean`, `max`, `min`); a strided copy; `make-crunch-activation-backend` and `make-crunch-threaded-activation-backend` |
-| `array-morphisms-crunch-threads` | the POSIX-thread dispatchers for chunk kernels (`crunch-dispatch-f32`, `crunch-dispatch-f64`, `crunch-dispatch4-f32`, `crunch-dispatch4-f64`) and their settings |
+| `array-morphisms-crunch-threads` | the POSIX-thread dispatchers for chunk kernels (`crunch-dispatch-f32`, `crunch-dispatch-f64`, `crunch-dispatch4-f32`, `crunch-dispatch4-f64`), their settings, and the persistent worker pool they share |
 | `array-morphisms-crunch-blas-backend` | `crunch-{s,d}gemm`, `-gemm-strided`, `-gemv`, `-dot`, `-axpy` with the normalized signatures of `array-morphisms-blas-exec`; `crunch-native-build?` |
 | `array-morphisms-crunch-conv-backend` | NCHW/NHWC `im2col`, `col2im`, `bias-add`, the six convolution hooks, and `make-crunch-blas-backend` (the complete `blas-backend` record) |
 | `array-morphisms-crunch-optimizers` | `crunch-adam-f32` and `crunch-adam-f64`, whole-vector Adam updates for nanograd's optimizer-kernel registry |
@@ -189,11 +189,22 @@ kernel computes the entry for elements `[start, end)`.
 The threaded backend passes the chunk kernel's C address to
 `crunch-dispatch-f32` or `crunch-dispatch-f64`. The dispatcher splits
 `[0, n)` into `T` nearly equal contiguous chunks and runs the first chunk on
-the calling thread. It runs each other chunk on a new POSIX thread, then
-joins them all. `T` is `max(1, min(threads, n div min-chunk, 64))`, so an
-array shorter than two chunks never creates a thread. The chunks are
-disjoint and every element is computed on its own, so the result is the
-same for every thread count.
+the calling thread. It hands each other chunk to a worker of a persistent
+POSIX thread pool and waits until all are done. `T` is
+`max(1, min(threads, n div min-chunk, 64))`, so an array shorter than two
+chunks runs on the calling thread alone. The chunks are disjoint and every
+element is computed on its own, so the result is the same for every thread
+count.
+
+The pool (`crunch-thread-pool.h`) is created at the first dispatch with
+`T > 1`. It grows to the largest `T` requested, up to 63 workers, and keeps
+its workers until `(crunch-thread-pool-shutdown!)` or the end of the
+process. A worker that has finished a chunk spins for a short time, so the
+next kernel of a replay finds it awake, and then sleeps on a condition
+variable. The calling thread waits for the workers in the same way.
+Spinning is turned off for a dispatch that requests more threads than there
+are processors online. A child process created by `fork` starts with an
+empty pool and creates it again at its first threaded dispatch.
 
 Why the threads are safe to use with CHICKEN:
 - **No CHICKEN heap access.** The workers only run the crunch-generated C
@@ -202,10 +213,10 @@ Why the threads are safe to use with CHICKEN:
 - **No reference counting.** The descriptors have a reference count of -1,
   which Crunch never changes.
 - **No GC during the call.** The calling thread stays inside the one foreign
-  call until every worker has been joined, so the vectors cannot move.
+  call until every chunk has finished, so the vectors cannot move.
 - **Signals stay on the CHICKEN thread.** All signals are blocked in the
   workers.
-- **Thread-creation failure is harmless.** If a thread cannot be created, its
+- **Thread-creation failure is harmless.** If a worker cannot be created, its
   chunk runs on the calling thread instead.
 
 This backend has two configurable parameters, read at every call:
@@ -214,7 +225,23 @@ This backend has two configurable parameters, read at every call:
   the environment variable `AM_CRUNCH_THREADS` if that is set, and otherwise
   to the number of online processors, at most 8.
 - `(crunch-thread-min-chunk)` is the smallest number of elements given to one
-  thread. It defaults to 16384.
+  thread. It defaults to 4096.
+
+The pool has its own setting and introspection procedures:
+
+- `(crunch-thread-pool-spin-us)` is the number of microseconds a waiting
+  thread spins before it sleeps. It defaults to the environment variable
+  `AM_CRUNCH_SPIN_US` if that is set, and otherwise to 20; 0 disables
+  spinning. `(crunch-thread-pool-spin-us-set! us)` changes it.
+- `(crunch-thread-pool-size)` is the number of workers.
+- `(crunch-thread-pool-stats)` returns counters for tuning: pool dispatches,
+  chunks found by a spinning worker, chunks found after sleeping, and
+  dispatches whose caller had to sleep.
+
+The system BLAS backend's OpenBLAS has a thread pool of its own. The two
+are never busy at the same time, since a replay runs one kernel at a time;
+`AM_CRUNCH_THREADS` and `OPENBLAS_NUM_THREADS` set their sizes
+separately.
 
 Wall-clock times on a 16-core machine, f32, milliseconds per call
 (`tests/bench-threaded-activations.scm`):
@@ -226,10 +253,25 @@ Wall-clock times on a 16-core machine, f32, milliseconds per call
 | relu, 400K | - | 1.67 | 0.72 | 0.82 |
 | sigmoid, 4M | 669 | 31.1 | 10.4 | 11.2 |
 
-Threads are created and joined on every call; there is no thread pool.
-This costs some tens of microseconds per call, which is why a second
-thread only pays off at about 16K elements per thread. relu is limited by
-memory bandwidth and gains the least.
+These times were measured before the thread pool, when every call
+created and joined its threads at a cost of some tens of microseconds.
+Because of that cost, a second thread only paid off at about 16K
+elements per thread, and `crunch-thread-min-chunk` defaulted to 16384. relu is
+limited by memory bandwidth and gains the least.
+
+With the pool, a dispatch costs about 2 microseconds. Microseconds per
+pair of f32 kernels (sigmoid then relu), best of 5, on the same machine:
+
+| n | 1 thread | 2 threads | 4 threads | 8 threads | 8 threads, no pool |
+|---|---|---|---|---|---|
+| 4,096 | 29 | 20 | 14 | 12 | 450–520 |
+| 100,352 | 700 | 370–410 | 220–260 | 200–230 | 670–700 |
+| 802,816 | 5,500–6,300 | 3,100–3,400 | 1,800–2,200 | 1,600–1,700 | 2,000–2,200 |
+| 4,194,304 | 30,000–33,000 | 17,500–21,600 | 11,800–13,300 | 10,000–10,400 | 10,400–11,200 |
+
+A second thread now pays off at about 750 elements per thread for
+sigmoid and about 4K for relu, so `crunch-thread-min-chunk` defaults to
+4096.
 
 ## BLAS and convolution kernels
 

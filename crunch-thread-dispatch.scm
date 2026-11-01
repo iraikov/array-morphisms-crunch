@@ -6,32 +6,40 @@
 ;;;
 ;;; crunch-dispatch-f32 and crunch-dispatch-f64 split [0, n) into T
 ;;; contiguous chunks of nearly equal size, run the first chunk on the
-;;; calling thread and each other chunk on a new thread, and return
-;;; when all threads have been joined.  Since the chunks are disjoint
-;;; and each element is computed on its own, the result is the same
-;;; for every thread count.
+;;; calling thread and each other chunk on a worker thread, and return
+;;; when every chunk is done.  Since the chunks are disjoint and each
+;;; element is computed on its own, the result is the same for every
+;;; thread count.
 ;;;
 ;;; The number of threads is
 ;;;
 ;;;   T = max(1, min(threads, n div min-chunk, 64))
 ;;;
-;;; so an array shorter than two chunks runs on the calling thread alone,
-;;; without the cost of creating threads.  threads defaults to the value of
-;;; (crunch-thread-count) and min-chunk to (crunch-thread-min-chunk).
+;;; so an array shorter than two chunks runs on the calling thread alone.
+;;; threads defaults to the value of (crunch-thread-count) and min-chunk
+;;; to (crunch-thread-min-chunk).
+;;;
+;;; The workers belong to a persistent pool (crunch-thread-pool.h).  The
+;;; pool is created at the first dispatch with T > 1, grows to the
+;;; largest T requested, and is kept until crunch-thread-pool-shutdown!
+;;; or the end of the process.  Between dispatches a worker spins for
+;;; (crunch-thread-pool-spin-us) microseconds, so that the next kernel of
+;;; a replay finds it awake, and then sleeps.  The spin time defaults to
+;;; the environment variable AM_CRUNCH_SPIN_US, or 20 microseconds.
 ;;;
 ;;; The worker threads do not touch the CHICKEN heap or call into the
 ;;; CHICKEN runtime.  The dispatcher describes the two vectors to the
 ;;; kernel with block descriptors on its own stack, pointing at the
 ;;; vectors' storage; the descriptors have a reference count of -1, so
 ;;; the threads can share them without synchronisation.  The calling
-;;; thread stays inside the one foreign call until every worker has
+;;; thread stays inside the one foreign call until every chunk has
 ;;; finished, so no garbage collection can move the vectors in the
 ;;; mean time.
 ;;;
 ;;; All signals are blocked in the workers, so CHICKEN's signal
 ;;; handler only ever runs on the thread that owns the runtime.  If a
-;;; thread cannot be created, its chunk runs on the calling thread
-;;; instead.
+;;; worker cannot be created, its chunk runs on the calling thread
+;;; instead.  A child process created by fork starts with an empty pool.
 ;;;
 ;;;   (import array-morphisms-crunch-threads)
 ;;;   (crunch-thread-count 8)
@@ -46,7 +54,12 @@
    crunch-thread-count
    crunch-thread-min-chunk
    crunch-available-processors
-   crunch-max-threads)
+   crunch-max-threads
+   crunch-thread-pool-size
+   crunch-thread-pool-shutdown!
+   crunch-thread-pool-stats
+   crunch-thread-pool-spin-us
+   crunch-thread-pool-spin-us-set!)
 
   (import scheme (chicken base) (chicken foreign) (chicken number-vector)
           (chicken process-context) (only (chicken memory) pointer?)
@@ -55,11 +68,9 @@
   (foreign-declare #<<EOC
 #define CRUNCH_EMBEDDED
 #include "crunch.h"
-#include <pthread.h>
-#include <signal.h>
-#include <unistd.h>
+#include "crunch-thread-pool.h"
 
-#define AM_MAX_THREADS 64
+#define AM_MAX_THREADS AM_POOL_MAX_THREADS
 
 /* Point descriptor b at the element storage of SRFI-4 vector vec (slot 1
    of the vector structure is its bytevector). */
@@ -73,6 +84,16 @@ static void am_wrap_ ## t(C_word vec, crunch_ ## t ## vector_block *b) {     \
   b->data  = (et *)C_data_pointer(bv);                                       \
 }
 
+/* The thread count for n units: max(1, min(nthreads, n div min_chunk, 64)). */
+static long am_thread_count(long n, int nthreads, long min_chunk) {
+  long T = nthreads;
+  if (min_chunk < 1) min_chunk = 1;
+  if (T > n / min_chunk) T = n / min_chunk;
+  if (T > AM_MAX_THREADS) T = AM_MAX_THREADS;
+  if (T < 1) T = 1;
+  return T;
+}
+
 /* am_dispatch_<t>: see the module comment.  Returns the thread count T. */
 #define AM_DEFINE_DISPATCH(t, et)                                            \
 typedef void (*am_chunk_ ## t)(crunch_integer, crunch_integer,              \
@@ -83,24 +104,16 @@ typedef struct {                                                             \
   am_chunk_ ## t fn;                                                         \
 } am_job_ ## t;                                                              \
                                                                              \
-static void *am_worker_ ## t(void *p) {                                      \
-  am_job_ ## t *j = (am_job_ ## t *)p;                                       \
+static void am_run_ ## t(void *p, long k) {                                  \
+  am_job_ ## t *j = (am_job_ ## t *)p + k;                                   \
   j->fn(j->start, j->end, j->in, j->out);                                    \
-  return NULL;                                                               \
 }                                                                            \
                                                                              \
 static int am_dispatch_ ## t(long n, C_word in, C_word out, void *fn,        \
                              int nthreads, long min_chunk) {                 \
   crunch_ ## t ## vector_block bin, bout;                                    \
-  pthread_t th[AM_MAX_THREADS];                                              \
   am_job_ ## t jobs[AM_MAX_THREADS];                                         \
-  int started[AM_MAX_THREADS];                                               \
-  sigset_t all, old;                                                         \
-  long T = nthreads;                                                         \
-  if (min_chunk < 1) min_chunk = 1;                                          \
-  if (T > n / min_chunk) T = n / min_chunk;                                  \
-  if (T > AM_MAX_THREADS) T = AM_MAX_THREADS;                                \
-  if (T < 1) T = 1;                                                          \
+  long T = am_thread_count(n, nthreads, min_chunk);                          \
   am_wrap_ ## t(in, &bin);                                                   \
   am_wrap_ ## t(out, &bout);                                                 \
   for (long k = 0; k < T; k++) {                                             \
@@ -110,18 +123,7 @@ static int am_dispatch_ ## t(long n, C_word in, C_word out, void *fn,        \
     jobs[k].out   = &bout;                                                   \
     jobs[k].fn    = (am_chunk_ ## t)fn;                                      \
   }                                                                          \
-  if (T > 1) {                                                               \
-    sigfillset(&all);                                                        \
-    pthread_sigmask(SIG_SETMASK, &all, &old);                                \
-    for (long k = 1; k < T; k++)                                             \
-      started[k] = pthread_create(&th[k], NULL, am_worker_ ## t, &jobs[k]) == 0; \
-    pthread_sigmask(SIG_SETMASK, &old, NULL);                                \
-  }                                                                          \
-  am_worker_ ## t(&jobs[0]);                                                 \
-  for (long k = 1; k < T; k++) {                                             \
-    if (started[k]) pthread_join(th[k], NULL);                               \
-    else am_worker_ ## t(&jobs[k]);                                          \
-  }                                                                          \
+  am_pool_run_chunks(am_run_ ## t, jobs, T);                                 \
   return (int)T;                                                             \
 }
 
@@ -144,11 +146,10 @@ typedef struct {                                                             \
   am_chunk4_ ## t fn;                                                        \
 } am_job4_ ## t;                                                             \
                                                                              \
-static void *am_worker4_ ## t(void *p) {                                     \
-  am_job4_ ## t *j = (am_job4_ ## t *)p;                                     \
+static void am_run4_ ## t(void *p, long k) {                                 \
+  am_job4_ ## t *j = (am_job4_ ## t *)p + k;                                 \
   j->fn(j->start, j->end, j->i0, j->i1, j->i2, j->scal,                      \
         j->v0, j->v1, j->v2, j->v3);                                         \
-  return NULL;                                                               \
 }                                                                            \
                                                                              \
 static int am_dispatch4_ ## t(long n, long i0, long i1, long i2,             \
@@ -157,15 +158,8 @@ static int am_dispatch4_ ## t(long n, long i0, long i1, long i2,             \
                               int nthreads, long min_chunk) {                \
   crunch_f64vector_block bscal;                                              \
   crunch_ ## t ## vector_block b0, b1, b2, b3;                               \
-  pthread_t th[AM_MAX_THREADS];                                              \
   am_job4_ ## t jobs[AM_MAX_THREADS];                                        \
-  int started[AM_MAX_THREADS];                                               \
-  sigset_t all, old;                                                         \
-  long T = nthreads;                                                         \
-  if (min_chunk < 1) min_chunk = 1;                                          \
-  if (T > n / min_chunk) T = n / min_chunk;                                  \
-  if (T > AM_MAX_THREADS) T = AM_MAX_THREADS;                                \
-  if (T < 1) T = 1;                                                          \
+  long T = am_thread_count(n, nthreads, min_chunk);                          \
   am_wrap_f64(scal, &bscal);                                                 \
   am_wrap_ ## t(v0, &b0);                                                    \
   am_wrap_ ## t(v1, &b1);                                                    \
@@ -179,18 +173,7 @@ static int am_dispatch4_ ## t(long n, long i0, long i1, long i2,             \
     jobs[k].v0 = &b0; jobs[k].v1 = &b1; jobs[k].v2 = &b2; jobs[k].v3 = &b3;  \
     jobs[k].fn = (am_chunk4_ ## t)fn;                                        \
   }                                                                          \
-  if (T > 1) {                                                               \
-    sigfillset(&all);                                                        \
-    pthread_sigmask(SIG_SETMASK, &all, &old);                                \
-    for (long k = 1; k < T; k++)                                             \
-      started[k] = pthread_create(&th[k], NULL, am_worker4_ ## t, &jobs[k]) == 0; \
-    pthread_sigmask(SIG_SETMASK, &old, NULL);                                \
-  }                                                                          \
-  am_worker4_ ## t(&jobs[0]);                                                \
-  for (long k = 1; k < T; k++) {                                             \
-    if (started[k]) pthread_join(th[k], NULL);                               \
-    else am_worker4_ ## t(&jobs[k]);                                         \
-  }                                                                          \
+  am_pool_run_chunks(am_run4_ ## t, jobs, T);                                \
   return (int)T;                                                             \
 }
 
@@ -258,14 +241,57 @@ EOC
     (make-parameter (default-thread-count)
                     (positive-fixnum-guard 'crunch-thread-count)))
 
-  ;; Smallest number of elements worth giving to one thread.  Creating
-  ;; and joining a thread costs some tens of microseconds; in
-  ;; wall-clock measurements of the f32 sigmoid, tanh and relu kernels
-  ;; a second thread starts to pay off at about 16K elements per
-  ;; thread.  See tests/bench-threaded-activations.scm.
+  ;; Smallest number of elements worth giving to one thread.  In
+  ;; wall-clock measurements of pairs of f32 kernels a second thread
+  ;; pays off at about 4K elements per thread for relu and at under 1K
+  ;; for sigmoid.  See tests/bench-threaded-activations.scm.
   (define crunch-thread-min-chunk
-    (make-parameter 16384
+    (make-parameter 4096
                     (positive-fixnum-guard 'crunch-thread-min-chunk)))
+
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; Thread pool
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  (define (crunch-thread-pool-size)
+    "Number of worker threads in the pool (0 before the first threaded
+    dispatch and after crunch-thread-pool-shutdown!)."
+    ((foreign-lambda int "am_pool_size")))
+
+  (define (crunch-thread-pool-shutdown!)
+    "Stop and join every worker thread.  The next threaded dispatch
+    creates the pool again.  Returns the number of workers stopped."
+    (let ((n ((foreign-lambda int "am_pool_shutdown"))))
+      (when (< n 0)
+        (error 'crunch-thread-pool-shutdown! "a dispatch is in progress"))
+      n))
+
+  (define (crunch-thread-pool-stats)
+    "Counters since the start of the process, as an association list:
+    dispatches (calls that used the pool), spin-hits (chunks a worker
+    found while spinning), wakeups (chunks a worker found after going to
+    sleep) and caller-sleeps (dispatches whose caller slept while
+    waiting for the workers)."
+    (let ((stat (foreign-lambda unsigned-long "am_pool_stat" int)))
+      (list (cons 'dispatches    (stat (foreign-value "AM_POOL_STAT_DISPATCHES" int)))
+            (cons 'spin-hits     (stat (foreign-value "AM_POOL_STAT_SPIN_HITS" int)))
+            (cons 'wakeups       (stat (foreign-value "AM_POOL_STAT_WAKEUPS" int)))
+            (cons 'caller-sleeps (stat (foreign-value "AM_POOL_STAT_CALLER_SLEEPS" int))))))
+
+  (define (crunch-thread-pool-spin-us)
+    "Microseconds a waiting thread spins before it sleeps."
+    ((foreign-lambda long "am_pool_spin_us")))
+
+  (define crunch-thread-pool-max-spin-us
+    (foreign-value "AM_POOL_MAX_SPIN_US" long))
+
+  (define (crunch-thread-pool-spin-us-set! us)
+    "Set the spin time to us microseconds, a fixnum from 0 (sleep at
+    once) to 1000000."
+    (unless (and (fixnum? us) (<= 0 us crunch-thread-pool-max-spin-us))
+      (error 'crunch-thread-pool-spin-us-set!
+             "spin time must be a fixnum from 0 to 1000000" us))
+    ((foreign-lambda void "am_pool_set_spin_us" long) us))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Dispatch
