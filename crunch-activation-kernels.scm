@@ -124,6 +124,25 @@
   (define-syntax define-crunch-activations
     (er-macro-transformer
      (lambda (form r c)
+       ;; Rewrites (if test 1.0 0.0) in a table expression as
+       ;; (exact->inexact (if test 1 0)), and (if test 0.0 1.0) likewise,
+       ;; which gives the same flonum for every input, NaN, infinities and
+       ;; -0.0 included.  crunch compiles an if to a C if statement, and
+       ;; the C compiler keeps a branch on a test whose two arms store
+       ;; flonum constants; for inputs whose sign varies at random that
+       ;; branch is mispredicted about half the time, and the misses cost
+       ;; far more than the arithmetic of the loop.  With integer arms the
+       ;; compiler sets the integer from the comparison flag and converts
+       ;; it, so the loop has no branch on the data.
+       (define (branch-free-indicators e)
+         (cond ((not (pair? e)) e)
+               ((and (eq? (car e) 'if) (= (length e) 4)
+                     (memv (caddr e) '(0.0 1.0)) (memv (cadddr e) '(0.0 1.0))
+                     (not (eqv? (caddr e) (cadddr e))))
+                `(exact->inexact (if ,(branch-free-indicators (cadr e))
+                                     ,(inexact->exact (caddr e))
+                                     ,(inexact->exact (cadddr e)))))
+               (else (map branch-free-indicators e))))
        (define (kernel-name op dtype)
          (string->symbol
           (string-append "crunch-" (symbol->string op) "-" (symbol->string dtype))))
@@ -169,7 +188,7 @@
                                     (symbol? (car (cadr e))))
                          (error 'define-crunch-activations
                                 "the table entry must have one parameter" e))
-                       (list (car e) (cadr e) (caddr e))))
+                       (list (car e) (cadr e) (branch-free-indicators (caddr e)))))
                    (cdr form))))
          `(,(r 'begin)
            ,@(apply append
@@ -790,6 +809,16 @@
   (define-syntax define-crunch-fused
     (er-macro-transformer
      (lambda (form r c)
+       ;; As in define-crunch-activations.
+       (define (branch-free-indicators e)
+         (cond ((not (pair? e)) e)
+               ((and (eq? (car e) 'if) (= (length e) 4)
+                     (memv (caddr e) '(0.0 1.0)) (memv (cadddr e) '(0.0 1.0))
+                     (not (eqv? (caddr e) (cadddr e))))
+                `(exact->inexact (if ,(branch-free-indicators (cadr e))
+                                     ,(inexact->exact (caddr e))
+                                     ,(inexact->exact (cadddr e)))))
+               (else (map branch-free-indicators e))))
        (define (strip-casts e)
          (cond ((not (pair? e)) e)
                ((eq? (car e) 'cast) (strip-casts (caddr e)))
@@ -816,7 +845,7 @@
                          (unless (= (length params) (length (cdr e)))
                            (error 'define-crunch-fused "wrong number of arguments" e))
                          `(let ,(map (lambda (p a) (list p (translate a dtype))) params (cdr e))
-                            ,(caddr entry)))))
+                            ,(branch-free-indicators (caddr entry))))))
                  (else (error 'define-crunch-fused "not a table op" e)))))
        (define (kernel-name k dtype)
          (string->symbol (string-append "am_crunch_fused_" (number->string k) "_"
