@@ -28,10 +28,13 @@
                         (csc-options "-O2" "-d1" "-C" "-O3 -DNDEBUG -fno-semantic-interposition")
                         (link-options "-L" "-lpthread")
                         (component-dependencies array-morphisms-crunch-threads))
+             ;; The GEMM kernels' functions and loops are aligned to 64 bytes,
+             ;; so that their speed does not depend on where the code before
+             ;; them in the file happens to end.
              (extension array-morphisms-crunch-blas-backend
                         (source "crunch-blas-backend.scm")
                         (source-dependencies "crunch-numvector-fix.scm")
-                        (csc-options "-O2" "-d1" "-C" "-O3 -DNDEBUG")
+                        (csc-options "-O2" "-d1" "-C" "-O3 -DNDEBUG -falign-functions=64 -falign-loops=64")
                         (component-dependencies array-morphisms-crunch-threads))
              (extension array-morphisms-crunch-optimizers
                         (source "crunch-optimizer-kernels.scm")
