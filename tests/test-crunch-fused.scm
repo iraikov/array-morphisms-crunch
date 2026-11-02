@@ -13,6 +13,9 @@
 ;;;             thread and several), at sizes around the thread chunks
 ;;;   Group 3 - Argument checking
 ;;;   Group 4 - SSA training graphs: fusion into the kernels
+;;;   Group 5 - Fused column sums: catalogue, values against the
+;;;             interpreter, argument checks and the bias gradients of
+;;;             SSA training graphs
 
 (import scheme (chicken base)
         test
@@ -202,6 +205,101 @@
           (test-assert (sprintf "~A ~A: the replay equals the unfused one" (car b) dtype)
             (equal? (cadr on) (cadr off)))))
       fz-backends))
+   '(f32 f64)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Group 5 - Fused column sums
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; The seg-red a column-sum kernel computes: body over the k inputs, rows
+;; x cols arrays, summed over the rows in dtype, the values kept in a map
+;; output.
+(define (fz-colsum-segop body dtype k rows cols)
+  (let* ((full (vector rows cols))
+         (t    (make-index-map '#((dim 1) (dim 0)) #f 0.0 #f))
+         (op   (lambda (slot shape m) (make-segop-operand slot dtype shape (compute-strides shape) 0 m))))
+    (make-seg-red (vector cols rows) 1
+                  (map (lambda (j) (op j full t)) (iota k))
+                  (list (make-red-result (op 'out (vector cols) (identity-index-map 1)) body
+                                         (make-combine-spec 'add 0.0 dtype) #f))
+                  (list (cons (op 'mo full t) body)))))
+
+(define fz-shapes '((1 1) (1 5) (7 1) (7 3) (33 16) (100 7)))
+
+(test-group "fused column sums"
+  (test-assert "there are column-sum bodies" (pair? (crunch-colsum-bodies)))
+  (for-each
+   (lambda (body32)
+     (test-assert (sprintf "~S is canonical" body32)
+       (equal? body32 (call-with-values (lambda () (canonical-scalar-body body32)) (lambda (c p) c))))
+     (for-each
+      (lambda (dtype)
+        (let* ((body (if (eq? dtype 'f32) body32 (fz-strip body32)))
+               (k    (fz-n-inputs body))
+               (kernel (lookup-colsum-kernel (cdar fz-backends) body dtype)))
+          (test-assert (sprintf "the one-thread backend holds the ~A kernel of ~S" dtype body) kernel)
+          (test-assert (sprintf "the threaded backend holds no ~A column sum of ~S" dtype body)
+            (not (lookup-colsum-kernel (cdadr fz-backends) body dtype)))
+          (test (sprintf "~A ~S: sums and kept values equal the interpreter's at every shape" dtype body)
+            (map (lambda (s) '(0 0)) fz-shapes)
+            (map (lambda (s)
+                   (let* ((rows (car s)) (cols (cadr s)) (n (* rows cols))
+                          (ins  (map (lambda (j) (fz-vector dtype n (* 11 (+ j 1)))) (iota k)))
+                          (mo   (allocate-typed-vector dtype n))
+                          (out  (allocate-typed-vector dtype cols))
+                          (rmo  (allocate-typed-vector dtype n))
+                          (rout (allocate-typed-vector dtype cols)))
+                     (kernel rows cols ins mo out)
+                     (segop-interpret (fz-colsum-segop body dtype k rows cols) ins (list rout rmo))
+                     (list (fz-mismatches out rout dtype cols) (fz-mismatches mo rmo dtype n))))
+                 fz-shapes))))
+      '(f32 f64)))
+   (crunch-colsum-bodies))
+  ;; The sum rounds to f32 after every row: 1e8 then ones gives 1e8.
+  (let* ((body (car (crunch-colsum-bodies)))
+         (kernel (lookup-colsum-kernel (cdar fz-backends) body 'f32))
+         (g (make-f32vector 5 1.0)) (x (make-f32vector 5 1.0))
+         (mo (make-f32vector 5)) (out (make-f32vector 1)))
+    (f32vector-set! g 0 1e8)
+    (kernel 5 1 (list g x) mo out)
+    (test "the f32 column sum rounds after every row" 1e8 (f32vector-ref out 0)))
+  (let ((k (lookup-colsum-kernel (cdar fz-backends) (car (crunch-colsum-bodies)) 'f32)))
+    (test-error "a missing input is an error"
+      (k 2 2 (list (make-f32vector 4)) (make-f32vector 4) (make-f32vector 2)))
+    (test-error "rows x cols beyond an input is an error"
+      (k 2 3 (list (make-f32vector 6) (make-f32vector 4)) (make-f32vector 6) (make-f32vector 3)))
+    (test-error "rows x cols beyond the map output is an error"
+      (k 2 3 (list (make-f32vector 6) (make-f32vector 6)) (make-f32vector 5) (make-f32vector 3)))
+    (test-error "cols beyond the sums is an error"
+      (k 2 3 (list (make-f32vector 6) (make-f32vector 6)) (make-f32vector 6) (make-f32vector 2)))))
+
+;; loss = sum(relu(x W + b) * c) for parameters W and b: the bias gradient
+;; sums g * relu-deriv(x W + b) over the batch, and the weight gradient
+;; reads that product too.
+(define (fz-bias-loss dtype)
+  (let* ((x (am:make-var (morph-from-list (map (lambda (i) (sin (* 0.37 i))) (iota 48)) #(8 6) dtype) #f))
+         (W (am:make-var (morph-from-list (map (lambda (i) (cos (* 0.53 i))) (iota 24)) #(6 4) dtype) #t))
+         (b (am:make-var (morph-from-list (map (lambda (i) (- (* 0.3 i) 0.4)) (iota 4)) #(4) dtype) #t))
+         (c (am:make-var (morph-from-list (map (lambda (i) (- (* 0.25 i) 3.0)) (iota 32)) #(8 4) dtype) #f)))
+    (values (am:var-sum (am:var* (am:var-relu (am:var+ (am:var-matmul x W) b)) c)) (list W b))))
+
+(define (fz-train-bias dtype be fusion)
+  (fluid-let ((fz-loss fz-bias-loss)) (fz-train dtype be fusion)))
+
+(test-group "fused column sums: SSA"
+  (for-each
+   (lambda (dtype)
+     (let ((off (fz-train-bias dtype (cdar fz-backends) #f)))
+       (let ((on (fz-train-bias dtype (cdar fz-backends) #t)))
+         (test-assert (sprintf "one thread ~A: the default fuses the bias gradient into a column sum" dtype)
+           (memq 'segop/colsum-kernel (caddr on)))
+         (test-assert (sprintf "one thread ~A: the gradients equal the unfused ones" dtype)
+           (and (equal? (car on) (car off)) (equal? (cadr on) (cadr off)))))
+       (let ((on (fz-train-bias dtype (cdadr fz-backends) #t)))
+         (test-assert (sprintf "threaded ~A: the bias gradient is not fused" dtype)
+           (not (memq 'segop/colsum-kernel (caddr on))))
+         (test-assert (sprintf "threaded ~A: the gradients equal the unfused ones" dtype)
+           (and (equal? (car on) (car off)) (equal? (cadr on) (cadr off)))))))
    '(f32 f64)))
 
 (test-exit)

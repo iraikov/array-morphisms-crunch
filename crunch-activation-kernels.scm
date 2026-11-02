@@ -83,6 +83,7 @@
    crunch-activation-ops
    crunch-activation-chunk-kernel
    crunch-fused-bodies
+   crunch-colsum-bodies
 
    ;; Raw kernels: (kernel n in out) -> void, no argument checking.
    crunch-relu-f32          crunch-relu-f64
@@ -795,7 +796,7 @@
   ;;; Fused kernels
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-  ;; (define-crunch-fused body ...)
+  ;; (define-crunch-fused body ... (colsum body ...))
   ;;
   ;; For each body, a segop body over one to three inputs written for f32
   ;; (see the module comment), defines an f32 and an f64 chunk kernel in
@@ -806,6 +807,14 @@
   ;; rounds e to single precision with a C conversion.  Binds
   ;; %crunch-fused-table to a list of
   ;;   (f32-body f64-body n-inputs f32-chunk-address f64-chunk-address).
+  ;;
+  ;; For each body of the optional last clause (colsum body ...), defines
+  ;; an f32 and an f64 column-sum kernel (rows cols v0 v1 v2 mo out).  It
+  ;; stores the body's value at each element of the rows x cols inputs in
+  ;; mo, and sums each column into out, adding the rows in order as the
+  ;; axis-0 sum kernels do.  Inputs beyond the body's are unused.  Binds
+  ;; %crunch-colsum-table to a list of
+  ;;   (f32-body f64-body n-inputs f32-kernel f64-kernel).
   (define-syntax define-crunch-fused
     (er-macro-transformer
      (lambda (form r c)
@@ -862,29 +871,60 @@
          `(,(r 'foreign-value)
            ,(string-append "((void *)&" (symbol->string (kernel-name k dtype)) ")")
            ,(r 'c-pointer)))
-       (let* ((bodies (cdr form))
-              (ks     (let loop ((i 0) (bs bodies)) (if (null? bs) '() (cons i (loop (+ i 1) (cdr bs))))))
-              (ns     (map (lambda (b)
-                             (let ((n (+ 1 (max-input b))))
-                               (unless (<= 1 n 3)
-                                 (error 'define-crunch-fused "a body must have one to three inputs" b))
-                               n))
-                           bodies)))
+       (define (colsum-name k dtype)
+         (string->symbol (string-append "am_crunch_colsum_" (number->string k) "_"
+                                        (symbol->string dtype))))
+       (define (colsum-def k body dtype)
+         (let ((vt  (if (eq? dtype 'f32) 'f32vector 'f64vector))
+               (ref (if (eq? dtype 'f32) 'f32vector-ref 'f64vector-ref))
+               (set (if (eq? dtype 'f32) 'f32vector-set! 'f64vector-set!)))
+           `((: (,(colsum-name k dtype) integer integer ,vt ,vt ,vt ,vt ,vt) void)
+             (define (,(colsum-name k dtype) rows cols %v0 %v1 %v2 %mo %out)
+               (do ((n 0 (+ n 1))) ((= n cols))
+                 (,set %out n 0.0))
+               (do ((m 0 (+ m 1))) ((= m rows))
+                 (let ((base (* m cols)))
+                   (do ((n 0 (+ n 1))) ((= n cols))
+                     (let ((%i (+ base n)))
+                       (,set %mo %i ,(translate body dtype))
+                       (,set %out n (+ (,ref %out n) (,ref %mo %i)))))))))))
+       (define (arity b)
+         (let ((n (+ 1 (max-input b))))
+           (unless (<= 1 n 3)
+             (error 'define-crunch-fused "a body must have one to three inputs" b))
+           n))
+       (define (indices xs) (let loop ((i 0) (bs xs)) (if (null? bs) '() (cons i (loop (+ i 1) (cdr bs))))))
+       (let* ((last    (and (pair? (cdr form)) (car (reverse (cdr form)))))
+              (colsum? (and (pair? last) (eq? (car last) 'colsum)))
+              (bodies  (if colsum? (reverse (cdr (reverse (cdr form)))) (cdr form)))
+              (cbodies (if colsum? (cdr last) '()))
+              (ks      (indices bodies))
+              (cks     (indices cbodies))
+              (ns      (map arity bodies))
+              (cns     (map arity cbodies)))
          `(,(r 'begin)
            ;; The f32 kernels round through a C conversion.  The egg compiles
            ;; this module with -fno-semantic-interposition so that the C
            ;; compiler may inline the conversion into each kernel loop.
            (,(r 'crunch)
             (define am-crunch-round-f32 (c-lambda ((float x)) float "return (double)(float)x;"))
-            ,@(apply append (map (lambda (k b n) (kernel-def k b n 'f32)) ks bodies ns)))
+            ,@(apply append (map (lambda (k b n) (kernel-def k b n 'f32)) ks bodies ns))
+            ,@(apply append (map (lambda (k b) (colsum-def k b 'f32)) cks cbodies)))
            (,(r 'crunch)
-            ,@(apply append (map (lambda (k b n) (kernel-def k (strip-casts b) n 'f64)) ks bodies ns)))
+            ,@(apply append (map (lambda (k b n) (kernel-def k (strip-casts b) n 'f64)) ks bodies ns))
+            ,@(apply append (map (lambda (k b) (colsum-def k (strip-casts b) 'f64)) cks cbodies)))
            (,(r 'define) %crunch-fused-table
             (,(r 'list)
              ,@(map (lambda (k b n)
                       `(,(r 'list) (,(r 'quote) ,b) (,(r 'quote) ,(strip-casts b)) ,n
                                    ,(address k 'f32) ,(address k 'f64)))
-                    ks bodies ns))))))))
+                    ks bodies ns)))
+           (,(r 'define) %crunch-colsum-table
+            (,(r 'list)
+             ,@(map (lambda (k b n)
+                      `(,(r 'list) (,(r 'quote) ,b) (,(r 'quote) ,(strip-casts b)) ,n
+                                   ,(colsum-name k 'f32) ,(colsum-name k 'f64)))
+                    cks cbodies cns))))))))
 
   ;; The fused bodies, chosen from the bodies the fusion pass forms in the
   ;; backward passes of convolutional, dense and transformer models:
@@ -900,7 +940,11 @@
     (negate (cast f32 (mul (in 0) (in 1))))
     (exp (cast f32 (negate (in 0))))
     (mul (in 0) (cast f32 (sigmoid (in 0))))
-    (mul (in 0) (cast f32 (mul (in 1) (cast f32 (sigmoid (in 1)))))))
+    (mul (in 0) (cast f32 (mul (in 1) (cast f32 (sigmoid (in 1))))))
+    ;; The bias gradient of a relu layer: g * relu'(z) summed over the
+    ;; batch, with g * relu'(z) kept for the other gradients.
+    (colsum
+     (cast f32 (mul (in 0) (cast f32 (relu-deriv (in 1)))))))
 
   (define (crunch-fused-bodies)
     "The f32 bodies of the fused kernels, in the canonical form under which
@@ -943,6 +987,42 @@
           (list f32vector-length f64vector-length)
           (list crunch-dispatch4-f32 crunch-dispatch4-f64))))
      %crunch-fused-table))
+
+  (define (crunch-colsum-bodies)
+    "The f32 bodies of the fused column-sum kernels, in the canonical form
+    under which the single-threaded backend holds them."
+    (map car %crunch-colsum-table))
+
+  ;; Installs the column-sum kernels of %crunch-colsum-table in backend be,
+  ;; as procedures (kernel rows cols ins mo out).  They run on one thread,
+  ;; because splitting the rows would change the order of the additions.
+  (define (add-colsum-kernels! be)
+    (for-each
+     (lambda (entry)
+       (let ((n (caddr entry)))
+         (for-each
+          (lambda (dtype body kernel vec-length)
+            (call-with-values (lambda () (canonical-scalar-body body))
+              (lambda (canon perm)
+                (unless (equal? canon body)
+                  (error 'add-colsum-kernels! "a column-sum body is not in canonical form" body))))
+            (activation-backend-add-colsum-kernel!
+             be body dtype
+             (lambda (rows cols ins mo out)
+               (unless (and (fixnum? rows) (fixnum? cols) (>= rows 0) (>= cols 0) (= (length ins) n)
+                            (<= (* rows cols) (vec-length mo)) (<= cols (vec-length out))
+                            (let loop ((vs ins))
+                              (or (null? vs) (and (<= (* rows cols) (vec-length (car vs))) (loop (cdr vs))))))
+                 (error 'colsum-kernel "inputs or sizes do not fit the kernel" body rows cols))
+               (let ((v0 (car ins))
+                     (v1 (if (> n 1) (cadr ins) out))
+                     (v2 (if (> n 2) (caddr ins) out)))
+                 (kernel rows cols v0 v1 v2 mo out)))))
+          '(f32 f64)
+          (list (car entry) (cadr entry))
+          (list (cadddr entry) (car (cddddr entry)))
+          (list f32vector-length f64vector-length))))
+     %crunch-colsum-table))
 
   (define (add-extended-kernels! be threads min-chunk)
     (for-each
@@ -1046,8 +1126,8 @@
     with register-activation-op!.  The backend also holds the binary
     kernels (add, sub, mul, div, whose names it registers with
     register-binary-op!), the axis-0 and axis-1 reduction kernels (sum,
-    mean, max, min), a strided copy kernel, and the fused kernels of
-    define-crunch-fused.
+    mean, max, min), a strided copy kernel, and the fused kernels and
+    fused column-sum kernels of define-crunch-fused.
 
     Usage:
       (import array-morphisms-crunch-activations)
@@ -1064,6 +1144,7 @@
        %crunch-activation-table)
       (add-extended-kernels! be (lambda () 1) crunch-thread-min-chunk)
       (add-fused-kernels! be (lambda () 1) crunch-thread-min-chunk)
+      (add-colsum-kernels! be)
       be))
 
   (define (crunch-activation-chunk-kernel op dtype)
@@ -1083,8 +1164,10 @@
     crunch-dispatch-f64, and register each op name with
     register-activation-op!.  Its binary kernels are split across threads in
     the same way, as are its fused kernels; its reduction and copy kernels
-    are those of make-crunch-activation-backend.  Every call uses the values of
-    crunch-thread-count and crunch-thread-min-chunk current at that call.
+    are those of make-crunch-activation-backend.  It has no column-sum
+    kernels, whose sums must add the rows in order on one thread.  Every
+    call uses the values of crunch-thread-count and crunch-thread-min-chunk
+    current at that call.
     The results are identical to those of make-crunch-activation-backend.
 
     Usage:

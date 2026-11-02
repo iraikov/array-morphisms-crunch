@@ -198,6 +198,26 @@ no such fusion, and plans are unchanged.
   inputs. The bodies the pass forms for a program are listed by
   `ssa-fusion-pass-stats` (`candidates`) under the fusion policy `'all`.
 
+### Fused column sums
+
+The single-threaded backend also holds a *column-sum kernel* for the bias
+gradient of a relu layer. It computes `g * relu-deriv(x)` and sums it over
+the batch in one pass, and also stores the product, which the weight
+gradient reads:
+
+| Body | Where the fusion pass forms it |
+|---|---|
+| `(cast f32 (mul (in 0) (cast f32 (relu-deriv (in 1)))))` | bias gradient of a relu layer |
+
+The kernel adds the rows in order, as the unfused sum does, so results do
+not change. The threaded backend has no column-sum kernels, because
+splitting the rows across threads would change that order.
+
+To add a body, add it to the `(colsum ...)` clause of `define-crunch-fused`
+in `crunch-activation-kernels.scm`, in canonical form. Under the fusion
+policy `'all`, `ssa-fusion-pass-stats` lists the bodies the pass forms
+(`red-candidates`).
+
 ## Row softmax and rotary embedding
 
 These kernels have no morphism op. They are called directly, on
