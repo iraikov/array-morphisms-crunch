@@ -352,14 +352,24 @@
        (register-activation-backend! #f)
        (let-values (((p0 without) (replay-forward (build))))
          (register-activation-backend! (make-crunch-activation-backend))
-         (let-values (((p1 with) (replay-forward (build))))
+         ;; Without fusion, each op runs as its own activation kernel.
+         (let-values (((p1 with) (parameterize ((segop-fusion #f)) (replay-forward (build))))
+                      ((p2 fused) (replay-forward (build))))
            (register-activation-backend! #f)
            (test (string-append "sqrt(abs(exp(-x))) " (symbol->string dtype)
                                 ": four activation instructions")
              4 (activation-instruction-count p1))
            (test-assert (string-append "sqrt(abs(exp(-x))) " (symbol->string dtype)
                                        ": identical with and without crunch")
-             (same-lists? without with))))))
+             (same-lists? without with))
+           ;; Under the default policy, exp(-x) is fused into one kernel at
+           ;; the first trace.
+           (test (string-append "sqrt(abs(exp(-x))) " (symbol->string dtype)
+                                ": exp(-x) runs as one fused kernel")
+             '((native . 1) (host . 0)) (cdr (assq 'fused (replay-plan-stats p2))))
+           (test-assert (string-append "sqrt(abs(exp(-x))) " (symbol->string dtype)
+                                       ": identical with fusion")
+             (same-lists? without fused))))))
    '(f64 f32)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

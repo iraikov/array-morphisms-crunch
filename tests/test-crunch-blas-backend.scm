@@ -236,6 +236,21 @@
   (test-assert "gemm-strided-f64 large transposed case (M=64 N=33 K=70, T/T, pad 2)"
     (strided-case crunch-dgemm-strided make-f64 1e-12 64 33 70 'trans 'trans 2 1.0 0.0))
 
+  ;; Packing buffers are reused from call to call: a sequence of products
+  ;; whose packed operands grow, shrink and grow again must each come out
+  ;; right, whichever free buffer it receives.
+  (test-assert "gemm-strided: products of changing sizes reuse packing buffers correctly"
+    (let loop ((sizes '((3 4 5) (40 30 50) (2 3 2) (17 9 33) (40 30 50) (1 1 1) (64 33 70)))
+               (ok #t))
+      (if (null? sizes)
+          ok
+          (let ((M (car (car sizes))) (N (cadr (car sizes))) (K (caddr (car sizes))))
+            (loop (cdr sizes)
+                  (and ok
+                       (strided-case crunch-sgemm-strided make-f32 1e-5 M N K 'trans 'trans 1 1.0 0.0)
+                       (strided-case crunch-dgemm-strided make-f64 1e-12 M N K 'trans 'no-trans 0 0.7 0.2)
+                       (strided-case crunch-sgemm-strided make-f32 1e-5 M N K 'no-trans 'trans 2 1.0 0.5)))))))
+
   (test-assert "gemm-strided with default lda equals plain gemm"
     (let ((A (make-f32 (* 6 4) gen-a)) (B (make-f32 (* 4 5) gen-b))
           (C1 (make-f32 30 gen-c)) (C2 (make-f32 30 gen-c)))

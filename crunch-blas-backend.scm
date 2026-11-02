@@ -23,7 +23,8 @@
 ;;; row stride of the stored matrix, a non-transposed A (stored M x K) has
 ;;; element strides (lda, 1) and a transposed A (stored K x M) has strides
 ;;; (1, lda); B is handled the same way.  An operand that is not already
-;;; plain row-major is packed into a row-major copy, and the product is
+;;; plain row-major is packed into a row-major copy, held in a buffer that
+;;; is reused by later calls, and the product is
 ;;; computed by a kernel for contiguous operands whose rows are shared
 ;;; among threads.  Each element of C is a sum over k in increasing order,
 ;;; so the result does not depend on the number of threads.
@@ -306,11 +307,53 @@
           1
           (max 1 (quotient (+ gemm-min-work-per-thread row-work -1) row-work)))))
 
+  ;; Packing buffers of one element type, reused from call to call, so
+  ;; that once the buffers have grown to the sizes in use a product with a
+  ;; transposed or strided operand allocates nothing.  Returns two
+  ;; procedures:
+  ;;
+  ;;   (take! n)  the shortest free buffer of at least n elements, removed
+  ;;              from the free list, or a new buffer when none is long
+  ;;              enough.  A call that allocates drops one free buffer that
+  ;;              was too short, so the list never holds more buffers than
+  ;;              are ever in use at the same time.
+  ;;   (give! b)  puts buffer b back on the free list.
+  ;;
+  ;; take! detaches the whole free list in one step before searching it,
+  ;; so two products in progress at once never receive the same buffer.
+  (define (make-pack-buffers vec-length make-vec)
+    (let ((free '()))
+      (define (give! b) (set! free (cons b free)))
+      (define (take! n)
+        (let ((bs free))
+          (set! free '())
+          (let loop ((bs bs) (best #f) (short #f) (rest '()))
+            (if (pair? bs)
+                (let ((b (car bs)))
+                  (cond ((< (vec-length b) n)
+                         (loop (cdr bs) best b (if short (cons short rest) rest)))
+                        ((or (not best) (< (vec-length b) (vec-length best)))
+                         (loop (cdr bs) b short (if best (cons best rest) rest)))
+                        (else (loop (cdr bs) best short (cons b rest)))))
+                (begin
+                  (for-each give! rest)
+                  (if best
+                      (begin (when short (give! short)) best)
+                      (make-vec n)))))))
+      (values take! give!)))
+
+  (define-values (take-pack-f32! give-pack-f32!)
+    (make-pack-buffers f32vector-length make-f32vector))
+  (define-values (take-pack-f64! give-pack-f64!)
+    (make-pack-buffers f64vector-length make-f64vector))
+
   ;; Computes C := alpha op(A) op(B) + beta C.  Operands that are not
   ;; stored in plain row-major order are first packed into row-major
-  ;; copies; the product is then computed by the contiguous kernel, with
-  ;; the rows of C shared among up to (crunch-thread-count) threads.
-  (define (gemm-strided who kernel pack dispatch vec-length make-vec
+  ;; copies, held in buffers from take! and returned with give! when the
+  ;; product is done; the product is then computed by the contiguous
+  ;; kernel, with the rows of C shared among up to (crunch-thread-count)
+  ;; threads.
+  (define (gemm-strided who kernel pack dispatch vec-length take! give!
                         M N K alpha A lda transa B ldb transb beta C)
     (check-dims! who M N K lda ldb)
     (let-values (((sai sak) (if (trans? transa) (values 1 lda) (values lda 1)))
@@ -318,27 +361,31 @@
       (check-length! who A vec-length (extent M K sai sak))
       (check-length! who B vec-length (extent K N sbk sbj))
       (check-length! who C vec-length (* M N))
-      (let ((A* (if (and (= sai K) (= sak 1))
-                    A
-                    (let ((packed (make-vec (* M K))))
-                      (pack M K A sai sak packed)
-                      packed)))
-            (B* (if (and (= sbk N) (= sbj 1))
-                    B
-                    (let ((packed (make-vec (* K N))))
-                      (pack K N B sbk sbj packed)
-                      packed))))
+      (let* ((pack-A? (not (and (= sai K) (= sak 1))))
+             (pack-B? (not (and (= sbk N) (= sbj 1))))
+             (A* (if pack-A?
+                     (let ((packed (take! (* M K))))
+                       (pack M K A sai sak packed)
+                       packed)
+                     A))
+             (B* (if pack-B?
+                     (let ((packed (take! (* K N))))
+                       (pack K N B sbk sbj packed)
+                       packed)
+                     B)))
         (dispatch M N K (* 8 (quotient N 8)) (scalars alpha beta) A* B* C C kernel
-                  (crunch-thread-count) (gemm-min-rows N K)))))
+                  (crunch-thread-count) (gemm-min-rows N K))
+        (when pack-A? (give! A*))
+        (when pack-B? (give! B*)))))
 
   (define (crunch-sgemm-strided M N K alpha A lda transa B ldb transb beta C)
     (gemm-strided 'crunch-sgemm-strided gemm-nn-f32 %k-pack-f32 crunch-dispatch4-f32
-                  f32vector-length make-f32vector
+                  f32vector-length take-pack-f32! give-pack-f32!
                   M N K alpha A lda transa B ldb transb beta C))
 
   (define (crunch-dgemm-strided M N K alpha A lda transa B ldb transb beta C)
     (gemm-strided 'crunch-dgemm-strided gemm-nn-f64 %k-pack-f64 crunch-dispatch4-f64
-                  f64vector-length make-f64vector
+                  f64vector-length take-pack-f64! give-pack-f64!
                   M N K alpha A lda transa B ldb transb beta C))
 
   ;; Row-major, no transposes: lda = K, ldb = N.

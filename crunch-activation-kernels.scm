@@ -889,14 +889,18 @@
   ;; The fused bodies, chosen from the bodies the fusion pass forms in the
   ;; backward passes of convolutional, dense and transformer models:
   ;; derivatives of the activations times the incoming gradient, x*y + z,
-  ;; the negated product, and exp(-x).
+  ;; the negated product, and exp(-x); and, from the forward pass of
+  ;; Llama's feed-forward block, silu(a) = a * sigmoid(a) and b * silu(a).
+  ;; silu is listed because the pass forms b * silu(a) from it.
   (define-crunch-fused
     (mul (in 0) (cast f32 (relu-deriv (in 1))))
     (mul (in 0) (cast f32 (sigmoid-deriv (in 1))))
     (mul (in 0) (cast f32 (tanh-deriv (in 1))))
     (add (in 0) (cast f32 (mul (in 1) (in 2))))
     (negate (cast f32 (mul (in 0) (in 1))))
-    (exp (cast f32 (negate (in 0)))))
+    (exp (cast f32 (negate (in 0))))
+    (mul (in 0) (cast f32 (sigmoid (in 0))))
+    (mul (in 0) (cast f32 (mul (in 1) (cast f32 (sigmoid (in 1)))))))
 
   (define (crunch-fused-bodies)
     "The f32 bodies of the fused kernels, in the canonical form under which

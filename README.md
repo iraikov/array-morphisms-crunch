@@ -174,6 +174,8 @@ them.
 | `(add (in 0) (cast f32 (mul (in 1) (in 2))))` | `x*y + z` |
 | `(negate (cast f32 (mul (in 0) (in 1))))` | negated product |
 | `(exp (cast f32 (negate (in 0))))` | `exp(-x)` |
+| `(mul (in 0) (cast f32 (sigmoid (in 0))))` | `silu(a)`, the first step towards the next body |
+| `(mul (in 0) (cast f32 (mul (in 1) (cast f32 (sigmoid (in 1))))))` | `b * silu(a)`, Llama's feed-forward block |
 
 The fusion pass of array-morphisms fuses bindings into one of these bodies
 only when the active backend holds its kernel. It then runs it as
@@ -316,7 +318,8 @@ sigmoid and about 4K for relu, so `crunch-thread-min-chunk` defaults to
 - GEMM operands follow the microBLAS shim's storage convention: `lda` is
   the row stride of the stored matrix, and a transposed operand is stored
   transposed. An operand that is not plain row-major is first packed into a
-  row-major copy.
+  row-major copy. Packing buffers are kept and reused by later calls, so
+  once they have grown to the sizes in use a product allocates nothing.
 - The product is computed by a kernel for contiguous operands that takes the
   columns of C eight at a time and keeps the eight partial sums in local
   double-precision variables. The rows of C are shared among up to
