@@ -940,11 +940,7 @@
     (negate (cast f32 (mul (in 0) (in 1))))
     (exp (cast f32 (negate (in 0))))
     (mul (in 0) (cast f32 (sigmoid (in 0))))
-    (mul (in 0) (cast f32 (mul (in 1) (cast f32 (sigmoid (in 1))))))
-    ;; The bias gradient of a relu layer: g * relu'(z) summed over the
-    ;; batch, with g * relu'(z) kept for the other gradients.
-    (colsum
-     (cast f32 (mul (in 0) (cast f32 (relu-deriv (in 1)))))))
+    (mul (in 0) (cast f32 (mul (in 1) (cast f32 (sigmoid (in 1)))))))
 
   (define (crunch-fused-bodies)
     "The f32 bodies of the fused kernels, in the canonical form under which

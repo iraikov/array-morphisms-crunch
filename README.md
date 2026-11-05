@@ -200,23 +200,18 @@ no such fusion, and plans are unchanged.
 
 ### Fused column sums
 
-The single-threaded backend also holds a *column-sum kernel* for the bias
-gradient of a relu layer. It computes `g * relu-deriv(x)` and sums it over
-the batch in one pass, and also stores the product, which the weight
-gradient reads:
+`define-crunch-fused` can also generate *column-sum kernels*, from bodies
+listed in a final `(colsum ...)` clause. Each one computes a body over
+row-major rows x cols inputs, stores the values, and sums each column,
+adding the rows in order as the unfused sum does. The fusion pass uses
+such a kernel for a map and the axis-0 sum that reads it.
 
-| Body | Where the fusion pass forms it |
-|---|---|
-| `(cast f32 (mul (in 0) (cast f32 (relu-deriv (in 1)))))` | bias gradient of a relu layer |
-
-The kernel adds the rows in order, as the unfused sum does, so results do
-not change. The threaded backend has no column-sum kernels, because
-splitting the rows across threads would change that order.
-
-To add a body, add it to the `(colsum ...)` clause of `define-crunch-fused`
-in `crunch-activation-kernels.scm`, in canonical form. Under the fusion
-policy `'all`, `ssa-fusion-pass-stats` lists the bodies the pass forms
-(`red-candidates`).
+The catalogue currently has no column-sum bodies. For the bias gradient of
+a relu layer, the one candidate, the fused kernel was no faster than the
+map kernel followed by the separate sum, because the sum reads the map's
+values while they are still in cache. A column-sum kernel must also run
+on one thread, since splitting the rows would change the order of the
+additions.
 
 ## Row softmax and rotary embedding
 
