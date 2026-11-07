@@ -22,12 +22,15 @@
                         (source-dependencies "crunch-thread-pool.h")
                         (csc-options "-O2" "-d1" "-C" "-O3 -DNDEBUG")
                         (link-options "-L" "-lpthread"))
+             (extension array-morphisms-crunch-translate
+                        (source "crunch-translate.scm"))
              (extension array-morphisms-crunch-activations
                         (source "crunch-activation-kernels.scm")
                         (source-dependencies "crunch-numvector-fix.scm")
                         (csc-options "-O2" "-d1" "-C" "-O3 -DNDEBUG -fno-semantic-interposition")
                         (link-options "-L" "-lpthread")
-                        (component-dependencies array-morphisms-crunch-threads))
+                        (component-dependencies array-morphisms-crunch-threads
+                                                array-morphisms-crunch-translate))
              ;; The GEMM kernels' functions and loops are aligned to 64 bytes,
              ;; so that their speed does not depend on where the code before
              ;; them in the file happens to end.

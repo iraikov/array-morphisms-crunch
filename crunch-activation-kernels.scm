@@ -107,7 +107,8 @@
   (import array-morphisms-activation-exec)
   (import (only array-morphisms-segop canonical-scalar-body))
   (import array-morphisms-crunch-threads)
-  (import-for-syntax scheme (chicken base) array-morphisms-scalar-ops-table)
+  (import-for-syntax scheme (chicken base) array-morphisms-scalar-ops-table
+                     array-morphisms-crunch-translate)
 
   (include "crunch-numvector-fix.scm")
 
@@ -125,25 +126,6 @@
   (define-syntax define-crunch-activations
     (er-macro-transformer
      (lambda (form r c)
-       ;; Rewrites (if test 1.0 0.0) in a table expression as
-       ;; (exact->inexact (if test 1 0)), and (if test 0.0 1.0) likewise,
-       ;; which gives the same flonum for every input, NaN, infinities and
-       ;; -0.0 included.  crunch compiles an if to a C if statement, and
-       ;; the C compiler keeps a branch on a test whose two arms store
-       ;; flonum constants; for inputs whose sign varies at random that
-       ;; branch is mispredicted about half the time, and the misses cost
-       ;; far more than the arithmetic of the loop.  With integer arms the
-       ;; compiler sets the integer from the comparison flag and converts
-       ;; it, so the loop has no branch on the data.
-       (define (branch-free-indicators e)
-         (cond ((not (pair? e)) e)
-               ((and (eq? (car e) 'if) (= (length e) 4)
-                     (memv (caddr e) '(0.0 1.0)) (memv (cadddr e) '(0.0 1.0))
-                     (not (eqv? (caddr e) (cadddr e))))
-                `(exact->inexact (if ,(branch-free-indicators (cadr e))
-                                     ,(inexact->exact (caddr e))
-                                     ,(inexact->exact (cadddr e)))))
-               (else (map branch-free-indicators e))))
        (define (kernel-name op dtype)
          (string->symbol
           (string-append "crunch-" (symbol->string op) "-" (symbol->string dtype))))
@@ -802,9 +784,10 @@
   ;; (see the module comment), defines an f32 and an f64 chunk kernel in
   ;; the calling convention of crunch-dispatch4-f32/-f64: v0 ... v(n-1) are
   ;; the inputs, vn the output, and the remaining vectors and i0-i2 and
-  ;; scal are unused.  Table ops are expanded from their entries in the
-  ;; scalar-op table, (in k) reads element i of input k, and (cast f32 e)
-  ;; rounds e to single precision with a C conversion.  Binds
+  ;; scal are unused.  The bodies are translated by translate-fused-body
+  ;; (crunch-translate.scm): table ops are expanded from their entries in
+  ;; the scalar-op table, (in k) reads element i of input k, and
+  ;; (cast f32 e) rounds e to single precision with a C conversion.  Binds
   ;; %crunch-fused-table to a list of
   ;;   (f32-body f64-body n-inputs f32-chunk-address f64-chunk-address).
   ;;
@@ -818,44 +801,10 @@
   (define-syntax define-crunch-fused
     (er-macro-transformer
      (lambda (form r c)
-       ;; As in define-crunch-activations.
-       (define (branch-free-indicators e)
-         (cond ((not (pair? e)) e)
-               ((and (eq? (car e) 'if) (= (length e) 4)
-                     (memv (caddr e) '(0.0 1.0)) (memv (cadddr e) '(0.0 1.0))
-                     (not (eqv? (caddr e) (cadddr e))))
-                `(exact->inexact (if ,(branch-free-indicators (cadr e))
-                                     ,(inexact->exact (caddr e))
-                                     ,(inexact->exact (cadddr e)))))
-               (else (map branch-free-indicators e))))
-       (define (strip-casts e)
-         (cond ((not (pair? e)) e)
-               ((eq? (car e) 'cast) (strip-casts (caddr e)))
-               ((eq? (car e) 'in) e)
-               (else (cons (car e) (map strip-casts (cdr e))))))
-       (define (max-input e)
-         (cond ((not (pair? e)) -1)
-               ((eq? (car e) 'in) (cadr e))
-               (else (let loop ((xs (cdr e)) (m -1))
-                       (if (null? xs) m (loop (cdr xs) (max m (max-input (car xs)))))))))
        (define (vec k) (string->symbol (string-append "%v" (number->string k))))
        (define (translate e dtype)
          (let ((ref (if (eq? dtype 'f32) 'f32vector-ref 'f64vector-ref)))
-           (cond ((number? e) (exact->inexact e))
-                 ((not (pair? e)) (error 'define-crunch-fused "unexpected body form" e))
-                 ((eq? (car e) 'in) `(,ref ,(vec (cadr e)) %i))
-                 ((eq? (car e) 'cast)
-                  (unless (and (eq? (cadr e) 'f32) (eq? dtype 'f32))
-                    (error 'define-crunch-fused "only casts to f32, in f32 bodies, are supported" e))
-                  `(am-crunch-round-f32 ,(translate (caddr e) dtype)))
-                 ((assq (car e) scalar-ops-table)
-                  => (lambda (entry)
-                       (let ((params (cadr entry)))
-                         (unless (= (length params) (length (cdr e)))
-                           (error 'define-crunch-fused "wrong number of arguments" e))
-                         `(let ,(map (lambda (p a) (list p (translate a dtype))) params (cdr e))
-                            ,(branch-free-indicators (caddr entry))))))
-                 (else (error 'define-crunch-fused "not a table op" e)))))
+           (translate-fused-body e dtype (lambda (k) `(,ref ,(vec k) %i)) 'define-crunch-fused)))
        (define (kernel-name k dtype)
          (string->symbol (string-append "am_crunch_fused_" (number->string k) "_"
                                         (symbol->string dtype))))
@@ -889,7 +838,7 @@
                        (,set %mo %i ,(translate body dtype))
                        (,set %out n (+ (,ref %out n) (,ref %mo %i)))))))))))
        (define (arity b)
-         (let ((n (+ 1 (max-input b))))
+         (let ((n (+ 1 (body-max-input b))))
            (unless (<= 1 n 3)
              (error 'define-crunch-fused "a body must have one to three inputs" b))
            n))
