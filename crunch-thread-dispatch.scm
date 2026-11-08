@@ -19,6 +19,12 @@
 ;;; threads defaults to the value of (crunch-thread-count) and min-chunk
 ;;; to (crunch-thread-min-chunk).
 ;;;
+;;; crunch-dispatch-n runs the kernels that array-morphisms-crunch-codegen
+;;; generates.  They take any number of numeric vectors, up to
+;;; crunch-dispatch-n-max-vectors, of any element type, through the job
+;;; record of crunch-dispatch-n.h, and each comes with a run procedure that
+;;; passes a job's arguments to the kernel.
+;;;
 ;;; The workers belong to a persistent pool (crunch-thread-pool.h).  The
 ;;; pool is created at the first dispatch with T > 1, grows to the
 ;;; largest T requested, and is kept until crunch-thread-pool-shutdown!
@@ -51,6 +57,8 @@
    crunch-dispatch-f64
    crunch-dispatch4-f32
    crunch-dispatch4-f64
+   crunch-dispatch-n
+   crunch-dispatch-n-max-vectors
    crunch-thread-count
    crunch-thread-min-chunk
    crunch-available-processors
@@ -69,6 +77,7 @@
 #define CRUNCH_EMBEDDED
 #include "crunch.h"
 #include "crunch-thread-pool.h"
+#include "crunch-dispatch-n.h"
 
 #define AM_MAX_THREADS AM_POOL_MAX_THREADS
 
@@ -179,10 +188,43 @@ static int am_dispatch4_ ## t(long n, long i0, long i1, long i2,             \
 
 AM_DEFINE_WRAP(f32, float)
 AM_DEFINE_WRAP(f64, double)
+AM_DEFINE_WRAP(s64, int64_t)
 AM_DEFINE_DISPATCH(f32, float)
 AM_DEFINE_DISPATCH(f64, double)
 AM_DEFINE_DISPATCH4(f32, float)
 AM_DEFINE_DISPATCH4(f64, double)
+
+/* am_dispatch_n: see crunch-dispatch-n.  vecs is a Scheme vector of
+   SRFI-4 vectors and esz an s32vector with the element size of each. */
+static int am_dispatch_n(long n, C_word ip, C_word sc, C_word vecs, C_word esz,
+                         void *run, int nthreads, long min_chunk) {
+  crunch_s64vector_block bip;
+  crunch_f64vector_block bsc;
+  crunch_vector_block bv[AM_DN_MAX_VECS];
+  am_jobn jobs[AM_MAX_THREADS];
+  long nv = C_header_size(vecs);
+  int32_t *es = (int32_t *)C_data_pointer(C_block_item(esz, 1));
+  long T = am_thread_count(n, nthreads, min_chunk);
+  am_wrap_s64(ip, &bip);
+  am_wrap_f64(sc, &bsc);
+  for (long j = 0; j < nv; j++) {
+    C_word bytes = C_block_item(C_block_item(vecs, j), 1);
+    bv[j].rc    = -1;
+    bv[j].flags = CRUNCH_BLOCK;
+    bv[j].size  = C_header_size(bytes);
+    bv[j].len   = bv[j].size / es[j];
+    bv[j].data  = C_data_pointer(bytes);
+  }
+  for (long k = 0; k < T; k++) {
+    jobs[k].start = n * k / T;
+    jobs[k].end   = n * (k + 1) / T;
+    jobs[k].ip    = &bip;
+    jobs[k].sc    = &bsc;
+    for (long j = 0; j < nv; j++) jobs[k].v[j] = &bv[j];
+  }
+  am_pool_run_chunks((am_pool_run)run, jobs, T);
+  return (int)T;
+}
 
 static int am_available_processors(void) {
   long p = sysconf(_SC_NPROCESSORS_ONLN);
@@ -205,6 +247,11 @@ EOC
     (foreign-lambda int "am_dispatch4_f64"
                     long long long long scheme-object scheme-object scheme-object
                     scheme-object scheme-object c-pointer int long))
+
+  (define %dispatch-n
+    (foreign-lambda int "am_dispatch_n"
+                    long scheme-object scheme-object scheme-object scheme-object
+                    c-pointer int long))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Thread-count settings
@@ -365,5 +412,39 @@ EOC
     (check-dispatch4 'crunch-dispatch4-f64 f64vector? n scal (list v0 v1 v2 v3)
                      kernel threads min-chunk)
     (%dispatch4-f64 n i0 i1 i2 scal v0 v1 v2 v3 kernel threads min-chunk))
+
+  (define crunch-dispatch-n-max-vectors (foreign-value "AM_DN_MAX_VECS" int))
+
+  (define (srfi-4-vector? v)
+    (or (f32vector? v) (f64vector? v) (s32vector? v) (s64vector? v)
+        (u32vector? v) (u64vector? v) (s8vector? v) (u8vector? v)
+        (s16vector? v) (u16vector? v)))
+
+  (define (crunch-dispatch-n n ip sc vecs esz run threads min-chunk)
+    "Run a generated kernel over the units [0, n), using up to threads
+    threads with at least min-chunk units each, the first chunk on the
+    calling thread.  run is the C address of the kernel's run procedure
+    (see crunch-dispatch-n.h), ip an s64vector of integer parameters, sc
+    an f64vector of scalar parameters, vecs a vector of at most
+    crunch-dispatch-n-max-vectors SRFI-4 vectors and esz an s32vector
+    holding the element size in bytes of each.  The kernel decides which
+    elements it touches, without index checks, so the caller must make
+    sure that every index it uses lies within its vectors.  Returns the
+    number of threads used."
+    (unless (and (s64vector? ip) (f64vector? sc) (vector? vecs) (s32vector? esz)
+                 (<= (vector-length vecs) crunch-dispatch-n-max-vectors)
+                 (= (vector-length vecs) (s32vector-length esz)))
+      (error 'crunch-dispatch-n "invalid parameter vectors" ip sc vecs esz))
+    (do ((j 0 (+ j 1))) ((= j (vector-length vecs)))
+      (unless (srfi-4-vector? (vector-ref vecs j))
+        (error 'crunch-dispatch-n "not a numeric vector" (vector-ref vecs j))))
+    (unless (and (fixnum? n) (>= n 0))
+      (error 'crunch-dispatch-n "size must be a non-negative fixnum" n))
+    (unless (pointer? run)
+      (error 'crunch-dispatch-n "run must be a C function pointer" run))
+    (unless (and (fixnum? threads) (> threads 0) (fixnum? min-chunk) (> min-chunk 0))
+      (error 'crunch-dispatch-n "thread count and minimum chunk must be positive fixnums"
+             threads min-chunk))
+    (%dispatch-n n ip sc vecs esz run threads min-chunk))
 
 ) ;; end module array-morphisms-crunch-threads

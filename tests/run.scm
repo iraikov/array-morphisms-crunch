@@ -20,5 +20,6 @@
 (include-relative "test-crunch-conv-backend.scm")
 (include-relative "test-crunch-threads.scm")
 (include-relative "test-crunch-optimizers.scm")
+(include-relative "test-crunch-codegen.scm")
 
 (exit (min 255 (test-failure-count)))
