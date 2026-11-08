@@ -26,6 +26,7 @@
 ;;;             parameter updates, and the fusion class switches
 
 (import scheme (chicken base) (chicken file) (only (scheme base) open-output-string)
+        (only (chicken process-context) get-environment-variable)
         test
         (only srfi-1 iota every any filter list-index cons*)
         srfi-4
@@ -591,6 +592,27 @@
              (parameterize ((crunch-codegen-threads t) (crunch-thread-min-chunk 1))
                (every same-bits? (run-executor (cdr (car sels)) c) ref))))
          '(1 2 7)))))
+  ;; Kept points are computed in tiles along the last kept dimension; a
+  ;; tile stops at the end of a row and the rest of the row is computed one
+  ;; point at a time.
+  (let* ((c (red-case #(3 11 5) 1 (list (cons* 'a (flat-array 'f32 #(5 3 11) value-at)
+                                              (exprs-map '(dim 2) '(dim 0) '(dim 1))))
+                      (list (list 'f32 #(3 11) (exprs-map '(dim 0) '(dim 1)) '(exp (in 0))
+                                  (make-combine-spec 'add 0.0 'f32 'blocked 2) #f)
+                            (list 'f64 #(3 11) (exprs-map '(dim 0) '(dim 1)) '(in 0) (max-spec 'f64)
+                                  '(mul (reduced) 2.0)))
+                      (list (list 'f32 '(exp (in 0)))))))
+    (let-values (((results notes) (check-red-cases (list c))))
+      (test "two kept dimensions in tiles with a stored map output" '((segop/codegen-red #t #t))
+        (values results)))
+    (let-values (((sels notes) (cg-select-all (list (tcase-sg c)))))
+      (let ((ref (run-reference c)))
+        (for-each
+         (lambda (t)
+           (test-assert (sprintf "kept tiles on ~a threads give the interpreter's bits" t)
+             (parameterize ((crunch-codegen-threads t) (crunch-thread-min-chunk 1))
+               (every same-bits? (run-executor (cdr (car sels)) c) ref))))
+         '(1 2 5)))))
   ;; Standard reductions keep their own executors.
   (let ((c (red-case #(5 7) 1 (list (cons* 'a (flat-array 'f64 #(7 5) value-at) (exprs-map '(dim 1) '(dim 0))))
                      (list (list 'f64 #(5) (exprs-map '(dim 0)) '(in 0) (make-combine-spec 'add 0.0 'f64) #f))
@@ -878,7 +900,10 @@
       (test-assert "a class that is switched on is native" (crunch-codegen-native? (tpl 'map)))
       (test "a class that is switched off is not native" #f (crunch-codegen-native? (tpl 'horizontal)))
       (test-assert "a template made for no fusion is native" (crunch-codegen-native? (tpl #f))))
-    (test-error "an unknown class is an error" (crunch-codegen-fusions '(map sideways)))))
+    (test-error "an unknown class is an error" (crunch-codegen-fusions '(map sideways)))
+    (unless (get-environment-variable "AM_CRUNCH_CODEGEN_FUSIONS")
+      (test "by default the fusions into and after reductions are native" '(redomap epilogue)
+        (crunch-codegen-fusions)))))
 
 (for-each (lambda (d) (delete-directory d #t)) temp-dirs)
 

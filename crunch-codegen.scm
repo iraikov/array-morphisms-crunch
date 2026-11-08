@@ -103,20 +103,26 @@
   ;; The fusion classes (see segop templates in array-morphisms) whose
   ;; fused segops the backend reports as native, so that the default fusion
   ;; policy makes them: a list of map, kept, horizontal, redomap, epilogue
-  ;; and gemm-epilogue.  The segops of the other classes are not fused
+  ;; and gemm-epilogue (default: redomap and epilogue).  The segops of the other classes are not fused
   ;; under the default policy; under the policy all they are fused and
   ;; still run as generated kernels.
   (define all-fusion-classes '(map kept horizontal redomap epilogue gemm-epilogue))
 
   ;; The default: the classes named in the environment variable
   ;; AM_CRUNCH_CODEGEN_FUSIONS, separated by commas or spaces ("" for
-  ;; none), or all of them.
+  ;; none), or else the fusions of maps into reductions and of maps after
+  ;; reductions.  Those fuse passes over the same data into one kernel.
+  ;; A map fused into a map can take the producer of a GEMM's epilogue,
+  ;; and the GEMM then loses that epilogue, so map fusions are left to
+  ;; the catalogue unless asked for.
+  (define default-classes '(redomap epilogue))
+
   (define (default-fusion-classes)
     (let ((v (get-environment-variable "AM_CRUNCH_CODEGEN_FUSIONS")))
       (if v
           (filter (lambda (c) (memq c all-fusion-classes))
                   (map string->symbol (string-split v ", ")))
-          all-fusion-classes)))
+          default-classes)))
 
   (define crunch-codegen-fusions
     (make-parameter (default-fusion-classes)
@@ -359,8 +365,9 @@
                                ,@(map (lambda (j) `(set! ,(o j) (+ ,(o j) (* %cnt ,(c j last))))) ops)
                                ,carry)))))))))))
 
-;;; A seg-red kernel visits the kept points [start, end), the points of
-  ;;; the first npar dimensions, in row-major order.  For each it sets the
+  ;;; A seg-red kernel visits the kept points [start, end), the points of
+  ;;; the first npar dimensions, in row-major order, one at a time or in
+  ;;; tiles along the last kept dimension (see red-tile-size).  For each it sets the
   ;;; accumulators to the neutral elements, walks the reduced points in
   ;;; row-major order, computing at each the bodies of the results and of
   ;;; the map outputs once, storing the map outputs and combining each
@@ -517,35 +524,114 @@
                                                        dims))))
                                         ops))
                             (map (lambda (r) (list (bsz r) `(s64vector-ref ip ,(+ rbase (* 2 r))))) (iota nres))))
-           (loops   (let loop ((ds rdims))
-                      (if (null? ds)
-                          (car st)
-                          `(do ((,(i (car ds)) 0 (+ ,(i (car ds)) 1))) ((= ,(i (car ds)) ,(e (car ds))))
-                             ,(loop (cdr ds)))))))
+           ;; the loops over the reduced dimensions around body
+           (loops   (lambda (body)
+                      (let loop ((ds rdims))
+                        (if (null? ds)
+                            body
+                            `(do ((,(i (car ds)) 0 (+ ,(i (car ds)) 1))) ((= ,(i (car ds)) ,(e (car ds))))
+                               ,(loop (cdr ds)))))))
+           ;; the accumulator bindings of one kept point
+           (acc-bindings (lambda (acc blk cnt)
+                           (apply append
+                                  (map (lambda (r) (list (list (acc r) (init r)) (list (blk r) (init r))
+                                                         (list (cnt r) 0)))
+                                       (iota nres)))))
+           (single  `(let* ,(acc-bindings acc blk cnt)
+                       ,(loops (car st))
+                       ,@(cadr st)
+                       ,@(caddr st)))
+           (tile    (and (> npar 0) (red-tile-forms spec n nops npar rdims ins outs dt-of c i po
+                                                    init))))
       (list
        `(: (,name integer integer s64vector f64vector ,@(map (lambda (j) (vector-type (dt-of j))) ops)) void)
        `(define (,name start end ip sc ,@(map v-name ops))
           (let* ,params
-            (do ((%p start (+ %p 1))) ((= %p end))
-              ;; The kept indices are computed without assignment: crunch
-              ;; loses the initial value of a variable that is bound to
-              ;; another variable and assigned later.
-              (let* (,@(apply append
-                              (map (lambda (d)
-                                     (let ((q (if (= d (- npar 1)) '%p (sym "%q" (+ d 1)))))
-                                       `((,(i d) (remainder ,q ,(e d)))
-                                         (,(sym "%q" d) (quotient ,q ,(e d))))))
-                                   (reverse pdims))))
-                (let* (,@(map (lambda (j)
+            (let ((%step 1))
+              (do ((%p start (+ %p %step))) ((>= %p end))
+                ;; The kept indices are computed without assignment: crunch
+                ;; loses the initial value of a variable that is bound to
+                ;; another variable and assigned later.
+                (let* (,@(apply append
+                                (map (lambda (d)
+                                       (let ((q (if (= d (- npar 1)) '%p (sym "%q" (+ d 1)))))
+                                         `((,(i d) (remainder ,q ,(e d)))
+                                           (,(sym "%q" d) (quotient ,q ,(e d))))))
+                                     (reverse pdims))))
+                  (let* ,(map (lambda (j)
                                 (list (po j) (sum-form (cons (b j) (map (lambda (d) `(* ,(c j d) ,(i d))) pdims)))))
                               ops)
-                       ,@(apply append
-                                (map (lambda (r) (list (list (acc r) (init r)) (list (blk r) (init r))
-                                                       (list (cnt r) 0)))
-                                     (iota nres))))
-                  ,loops
-                  ,@(cadr st)
-                  ,@(caddr st)))))))))
+                    ,(if tile
+                         `(if (and (<= (+ %p ,red-tile-size) end)
+                                   (<= (+ ,(i (- npar 1)) ,red-tile-size) ,(e (- npar 1))))
+                              (let* ,(caddr tile)
+                                ,(loops (car tile))
+                                ,@(cadr tile)
+                                (set! %step ,red-tile-size))
+                              (begin ,single
+                                     (set! %step 1)))
+                         single))))))))))
+
+  ;;; A seg-red kernel computes red-tile-size consecutive kept points
+  ;;; together when they lie along the last kept dimension: it walks the
+  ;;; reduced points once, and at each one computes every kept point of
+  ;;; the tile, each with its own accumulators.  Each accumulator combines
+  ;;; the same values in the same order as when the kept points are
+  ;;; computed one at a time, so the results are the same.  When the
+  ;;; inputs are contiguous along the kept dimension, as in a sum over the
+  ;;; rows of a matrix, the tile reads neighbouring elements at each
+  ;;; reduced point.
+  (define red-tile-size 8)
+
+  ;; The statements of a tile of kept points, in the scope of the kept
+  ;; offsets (po j) of its first point: a list
+  ;; (point-form final-forms bindings), where point-form computes every
+  ;; member of the tile at one reduced point, final-forms flush and store
+  ;; the results of every member, and bindings bind the offsets and the
+  ;; accumulators of the members; or #f when some body is not translated.
+  (define (red-tile-forms spec n nops npar rdims ins outs dt-of c i po init)
+    (let* ((results (red-results spec))
+           (nres    (length results))
+           (last    (- npar 1))
+           (ops     (iota nops))
+           (members (iota red-tile-size))
+           (pt      (lambda (j t) (sym "%po" j "t" t)))
+           (ro      (lambda (j) (sym "%ro" j)))
+           (names   (lambda (prefix t) (lambda (r) (sym prefix r "t" t))))
+           (sts     (map (lambda (t)
+                           (red-statements
+                            results (red-map-bodies spec) ins outs
+                            (lambda (j) `(,(vector-ref-name (dt-of j)) ,(v-name j) (+ ,(pt j t) ,(ro j))))
+                            (lambda (j) `(,(vector-ref-name (dt-of j)) ,(v-name j) ,(pt j t)))
+                            (lambda (j) `(+ ,(pt (+ n j) t) ,(ro (+ n j))))
+                            (lambda (j) (pt (+ n j) t))
+                            (names "%acc" t) (names "%blk" t) (names "%cnt" t)
+                            (lambda (r) (sym "%bs" r))
+                            init))
+                         members)))
+      (and (every values sts)
+           (list
+            ;; at one reduced point: the reduced offsets, then each member
+            `(let* ,(map (lambda (j) (list (ro j) (sum-form (cons 0 (map (lambda (d) `(* ,(c j d) ,(i d))) rdims)))))
+                         ops)
+               ,@(map car sts))
+            ;; after the reduced points: flushes and stores of each member
+            (apply append (map (lambda (st) (append (cadr st) (caddr st))) sts))
+            ;; the bindings of the member offsets and accumulators
+            (append
+             (apply append
+                    (map (lambda (t)
+                           (map (lambda (j) (list (pt j t) `(+ ,(po j) (* ,t ,(c j last))))) ops))
+                         members))
+             (apply append
+                    (map (lambda (t)
+                           (apply append
+                                  (map (lambda (r)
+                                         (list (list ((names "%acc" t) r) (init r))
+                                               (list ((names "%blk" t) r) (init r))
+                                               (list ((names "%cnt" t) r) 0)))
+                                       (iota nres))))
+                         members)))))))
 
   (define (kernel-forms k spec)
     (case (kspec-kind spec)
