@@ -20,6 +20,8 @@
    codegen-dtype-type
    translate-typed-bodies
    typed-store-form
+   typed-round-form
+   typed-combine-form
    typed-helper-definitions)
 
   (import scheme (chicken base) array-morphisms-scalar-ops-table
@@ -104,14 +106,18 @@
   ;;;     does; the transcendental ops and pow take flonums only;
   ;;;   - the other table ops convert their arguments to flonums and give a
   ;;;     flonum, and the comparisons compare their arguments exactly and
-  ;;;     give 1.0 or 0.0.
+  ;;;     give 1.0 or 0.0;
+  ;;;   - the arithmetic primitives +, -, *, /, expt, fpabs and the
+  ;;;     transcendental functions compute as the table ops of the same
+  ;;;     meaning, and (%gadd a b) is Scheme's generic +, which differs from
+  ;;;     add only in giving 0.0 for -0.0 + -0.0.
   ;;;
   ;;; Scheme integers have no bound, so an integer result that does not fit
   ;;; in 64 bits, a store of a value that does not fit its output dtype, and
   ;;; a division of a flonum by the integer 0 cannot be computed by the
   ;;; kernel.  The helpers that could meet such a case set the module's
   ;;; failure flag and return 0; the caller then runs the whole segop again
-  ;;; on the host, which computes it exactly or signals the error.  Bodies
+  ;;; on the host, so that its result, or its error, is the host's.  Bodies
   ;;; whose integer results would not be integers, such as the quotient of
   ;;; two integers, are not translated.
   ;;;
@@ -137,6 +143,19 @@
   (define generic-int-ops '(add sub mul negate abs floor ceiling))
   (define float-only-ops '(div pow exp log sqrt sin cos tan))
   (define comparison-ops '((gt . >) (lt . <) (eq . =) (ge . >=) (le . <=)))
+
+  ;; The table op that computes primitive name applied to n arguments as
+  ;; the primitive does (see scalar-primitives in array-morphisms), or name
+  ;; itself.  + is the primitive of the add op; the others are the generic
+  ;; Scheme procedures of the ops of the same meaning.
+  (define (primitive-op name n)
+    (case name
+      ((+) 'add)
+      ((-) (if (= n 1) 'negate 'sub))
+      ((*) 'mul)
+      ((/) 'div)
+      ((expt) 'pow)
+      (else name)))
 
   ;; Largest magnitude of an integer literal that a kernel embeds.
   (define max-literal (expt 2 62))
@@ -189,8 +208,19 @@
            (case (car e)
              ((cast) (tr-cast (cadr e) (tr (caddr e))))
              ((in reduced param idx opaque if let*) (fail))
+             ((%gadd)
+              (unless (= (length e) 3) (fail))
+              (let ((a (tr (cadr e))) (b (tr (caddr e))))
+                (cond ((all-int? (list a b)) (bind! `(,(checked! 'addi) ,(car a) ,(car b)) 'i))
+                      ((and (eq? (cdr a) 'f) (eq? (cdr b) 'f))
+                       (bind! `(+ (+ ,(car a) ,(car b)) 0.0) 'f))
+                      (else (bind! `(+ ,(to-float a) ,(to-float b)) 'f)))))
+             ((fpabs)
+              (unless (= (length e) 2) (fail))
+              (bind! (table-expansion (assq 'abs scalar-ops-table) (list (tr (cadr e)))) 'f))
              (else
-              (let ((entry (assq (car e) scalar-ops-table)))
+              (let* ((op    (primitive-op (car e) (length (cdr e))))
+                     (entry (assq op scalar-ops-table)))
                 (unless (and entry (= (length (cadr entry)) (length (cdr e)))) (fail))
                 (tr-op entry (map tr (cdr e)))))))
          (define (tr-cast dt a)
@@ -234,30 +264,31 @@
                      (else (bind! (table-expansion entry args) 'f))))
               (else (bind! (table-expansion entry args) 'f)))))
          (define (comparison-form rel args)
-           (let ((a (car args)) (b (cadr args)))
-             (define (indicator test) `(exact->inexact (if ,test 1 0)))
-             (cond
-              ((eq? (cdr a) (cdr b)) (indicator `(,rel ,(car a) ,(car b))))
-              (else
-               ;; c is the sign of a - b, from an exact comparison of the
-               ;; integer with the flonum, or 2 when the flonum is NaN.
-               (let* ((swap? (eq? (cdr a) 'f))
-                      (c (if swap?
-                             `(,(h 'cmpif) ,(car b) ,(car a))
-                             `(,(h 'cmpif) ,(car a) ,(car b))))
-                      (rel (if swap?
-                               (case rel ((>) '<) ((<) '>) ((>=) '<=) ((<=) '>=) (else rel))
-                               rel)))
-                 (indicator
-                  `(let ((%c ,c))
-                     ,(case rel
-                        ((>) '(= %c 1))
-                        ((<) '(= %c -1))
-                        ((=) '(= %c 0))
-                        ((>=) '(or (= %c 0) (= %c 1)))
-                        (else '(or (= %c 0) (= %c -1)))))))))))
+           `(exact->inexact (if ,(typed-comparison rel (car args) (cadr args) h) 1 0)))
          (let ((atoms (map tr bodies)))
            (list (reverse bindings) atoms may-fail?))))))
+
+  ;; The test (rel a b) for values a and b, pairs (form . type), compared
+  ;; exactly as Scheme compares them: a C comparison when both have the
+  ;; same type, and otherwise the sign of the difference of the integer
+  ;; and the flonum, from the helper cmpif (2 when the flonum is NaN).
+  (define (typed-comparison rel a b h)
+    (if (eq? (cdr a) (cdr b))
+        `(,rel ,(car a) ,(car b))
+        (let* ((swap? (eq? (cdr a) 'f))
+               (c (if swap?
+                      `(,(h 'cmpif) ,(car b) ,(car a))
+                      `(,(h 'cmpif) ,(car a) ,(car b))))
+               (rel (if swap?
+                        (case rel ((>) '<) ((<) '>) ((>=) '<=) ((<=) '>=) (else rel))
+                        rel)))
+          `(let ((%c ,c))
+             ,(case rel
+                ((>) '(= %c 1))
+                ((<) '(= %c -1))
+                ((=) '(= %c 0))
+                ((>=) '(or (= %c 0) (= %c 1)))
+                (else '(or (= %c 0) (= %c -1))))))))
 
   ;; The form converting value a, of type f or i, as storing it in an array
   ;; of integer dtype dt does: truncated towards zero, made non-negative for
@@ -279,6 +310,47 @@
       (let ((form (cond ((codegen-float-dtype? dt)
                          (if (eq? (cdr a) 'f) (car a) `(,(helper 'i2f) ,(car a))))
                         (else (int-store-form dt a (lambda (name) (set! fails? #t) (helper name)))))))
+        (values form fails?))))
+
+  (define (typed-round-form dt a helper)
+    "The form giving value a, a pair (form . type), rounded to dtype dt as
+    storing it in an array of dt and reading it back would round it, and
+    whether it can set the failure flag, as two values.  The value has
+    type f for a float dtype and i for an integer dtype."
+    (if (eq? dt 'f32)
+        (values `(,(helper 'r32) ,(if (eq? (cdr a) 'f) (car a) `(,(helper 'i2f) ,(car a)))) #f)
+        (typed-store-form dt a helper)))
+
+  (define (typed-combine-form op acc v acc-dt helper)
+    "The form combining the accumulator acc and the value v, pairs
+    (form . type), with combine op op (add, mul, max or min), and rounding
+    the result to the accumulator dtype acc-dt, as one step of a reduction
+    of array-morphisms does; and whether it can set the failure flag, as
+    two values.  Two flonums are added with generic Scheme addition, which
+    gives 0.0 for -0.0 + -0.0, as the IEEE sum plus 0.0 does; max and min
+    replace the accumulator only by a greater or a smaller value."
+    (let* ((fails? #f)
+           (checked (lambda (name) (set! fails? #t) (helper name)))
+           (fl (lambda (a) (if (eq? (cdr a) 'f) (car a) `(,(helper 'i2f) ,(car a)))))
+           (both-int? (and (eq? (cdr acc) 'i) (eq? (cdr v) 'i))))
+      (define (rounded a)
+        (let-values (((form f?) (typed-round-form acc-dt a helper)))
+          (when f? (set! fails? #t))
+          form))
+      (let ((form
+             (case op
+               ((add) (rounded (if both-int?
+                                   (cons `(,(checked 'addi) ,(car acc) ,(car v)) 'i)
+                                   (cons `(+ (+ ,(fl acc) ,(fl v)) 0.0) 'f))))
+               ((mul) (rounded (if both-int?
+                                   (cons `(,(checked 'muli) ,(car acc) ,(car v)) 'i)
+                                   (cons `(* ,(fl acc) ,(fl v)) 'f))))
+               ((max min)
+                ;; the accumulator already has the accumulator dtype
+                `(if ,(typed-comparison (if (eq? op 'max) '> '<) v acc helper)
+                     ,(rounded v)
+                     ,(car acc)))
+               (else (error 'typed-combine-form "unsupported combine op" op)))))
         (values form fails?))))
 
   (define (typed-helper-definitions helper flag)

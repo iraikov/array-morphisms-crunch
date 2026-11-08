@@ -19,12 +19,13 @@
 ;;;   Group 4 - Several outputs
 ;;;   Group 5 - Mixed and integer dtypes, and the failure fallback
 ;;;   Group 6 - Thread counts
+;;;   Group 6b - seg-reds, against the interpreter and the host executor
 ;;;   Group 7 - The cache and compile failures
 ;;;   Group 8 - Native queries and SSA programs
 
 (import scheme (chicken base) (chicken file) (only (scheme base) open-output-string)
         test
-        (only srfi-1 iota every any filter list-index)
+        (only srfi-1 iota every any filter list-index cons*)
         srfi-4
         datatype
         array-morphisms-core
@@ -246,7 +247,9 @@
     (mul (in 0) (cast f32 (mul (in 1) (cast f32 (sigmoid (in 1))))))
     (sub (cast f32 (tanh (cast f32 (add (in 0) (in 1))))) (cast f32 (div (in 2) (in 0))))
     (gt (cast f32 (mul (in 0) (in 1))) (in 2))
-    (add (add (in 0) (in 1)) (add (in 0) (in 1)))))
+    (add (add (in 0) (in 1)) (add (in 0) (in 1)))
+    (+ (* (in 0) (in 1)) (- (in 2)))
+    (fpabs (/ (in 0) (expt (in 1) 2.0)))))
 
 (test-group "fused bodies"
   (let ((env (list (cons 'a (flat-array 'f32 #(3 13) value-at))
@@ -308,6 +311,18 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Group 4 - Several outputs
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(test-group "opaque arithmetic"
+  (let* ((neg-zero (lambda (i) (if (even? i) -0.0 (value-at i))))
+         (env (list (cons 'a (flat-array 'f64 #(19) neg-zero))
+                    (cons 'b (flat-array 'f64 #(19) neg-zero))))
+         (cases (list (map-case #(19) env (list `(opaque ,+ (in 0) (in 1))) '(f64))
+                      (map-case #(19) env (list `(opaque ,* (in 0) (opaque ,- (in 1)))) '(f64))
+                      (map-case #(19) env (list `(opaque ,scalar-add (in 0) (opaque ,/ (in 1) (in 0)))) '(f64)))))
+    (let-values (((results notes) (check-cases cases)))
+      (for-each (lambda (name r) (test name '(segop/codegen-map . #t) (values r)))
+                '("Scheme + of signed zeros" "Scheme * and unary -" "scalar-add and Scheme /")
+                results))))
 
 (test-group "several outputs"
   (let* ((shared '(cast f32 (sigmoid (in 0))))
@@ -414,6 +429,176 @@
          '(1 2 7))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Group 6b - seg-reds
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (exprs-map . es) (make-index-map (list->vector es) #f 0.0 #f))
+
+;; A seg-red case over space, whose last nred dimensions are reduced.
+;; env is a list of (slot array . index-map); results a list of
+;; (dtype shape map body combine finalize), each written to a row-major
+;; output of that shape through map; map-outs a list of (dtype body),
+;; written over the whole space in row-major order.
+(define (red-case space nred env results map-outs)
+  (let* ((ins (map (lambda (e) (operand (car e) (cadr e) (cddr e))) env))
+         (res (map (lambda (r k)
+                     (make-red-result
+                      (make-segop-operand (string->symbol (sprintf "res~a" k)) (car r) (cadr r)
+                                          (compute-strides (cadr r)) 0 (caddr r))
+                      (list-ref r 3) (list-ref r 4) (list-ref r 5)))
+                   results (iota (length results))))
+         (mos (map (lambda (mo k)
+                     (cons (out-operand (string->symbol (sprintf "mo~a" k)) (car mo) space) (cadr mo)))
+                   map-outs (iota (length map-outs)))))
+    (make-tcase (make-seg-red space nred ins res mos)
+                (map (lambda (e) (cons (car e) (cadr e))) env)
+                (append (map (lambda (r) (shape-size (cadr r))) results)
+                        (map (lambda (mo) (shape-size space)) map-outs)))))
+
+(define (add-spec dt) (make-combine-spec 'add 0.0 dt))
+(define (max-spec dt) (make-combine-spec 'max -inf.0 dt))
+(define (min-spec dt) (make-combine-spec 'min +inf.0 dt))
+
+;; Results compared with the host executor (the strided reduction loop)
+;; as well as with the interpreter.
+(define (check-red-cases cases)
+  (let-values (((sels notes) (cg-select-all (map tcase-sg cases))))
+    (let ((hosts (parameterize ((segop-backends
+                                 (filter (lambda (b) (eq? (segop-backend-name b) 'scheme)) (segop-backends))))
+                   (map (lambda (c) (select-segop-executor (tcase-sg c))) cases))))
+      (values (map (lambda (sel host c)
+                     (let ((got (run-executor (cdr sel) c)))
+                       (list (car sel)
+                             (every same-bits? got (run-reference c))
+                             (every same-bits? got (run-executor (cdr host) c)))))
+                   sels hosts cases)
+              notes))))
+
+(define (red-cases)
+  (let* ((x  (lambda (dt) (flat-array dt #(7 5) value-at)))   ; rows x cols
+         (y  (lambda (dt) (flat-array dt #(7 5) value2-at)))
+         (z3 (flat-array 'f64 #(3 4 5) (lambda (i) (* 0.37 (- i 30)))))
+         (col (exprs-map '(dim 1) '(dim 0)))                   ; space (cols rows)
+         (row (exprs-map '(dim 0) '(dim 1))))                  ; space (rows cols)
+    (list
+     ;; axis-0 sum of g * relu'(z), f32 accumulator, with the product stored
+     (red-case #(5 7) 1 (list (cons* 'a (x 'f32) col) (cons* 'b (y 'f32) col))
+               (list (list 'f32 #(5) (exprs-map '(dim 0)) '(mul (in 0) (cast f32 (relu-deriv (in 1))))
+                           (add-spec 'f32) #f))
+               (list (list 'f32 '(mul (in 0) (cast f32 (relu-deriv (in 1)))))))
+     ;; axis-1 sum, f64 accumulator, mean finalize, f32 result
+     (red-case #(7 5) 1 (list (cons* 'a (x 'f32) row))
+               (list (list 'f32 #(7 1) (exprs-map '(dim 0) 0) '(exp (in 0)) (add-spec 'f64)
+                           '(div (reduced) 5.0)))
+               '())
+     ;; max and min over rows with NaN and infinities, f32
+     (red-case #(7 5) 1 (list (cons* 'a (x 'f32) row))
+               (list (list 'f32 #(7) (exprs-map '(dim 0)) '(in 0) (max-spec 'f32) #f)
+                     (list 'f32 #(7) (exprs-map '(dim 0)) '(in 0) (min-spec 'f32) #f))
+               '())
+     ;; a product, f64
+     (red-case #(5 7) 1 (list (cons* 'a (flat-array 'f64 #(7 5) (lambda (i) (+ 0.9 (* 0.01 i)))) col))
+               (list (list 'f64 #(5) (exprs-map '(dim 0)) '(add (in 0) 0.25) (make-combine-spec 'mul 1.0 'f64) #f))
+               '())
+     ;; two reduced dimensions of a rank-3 array, keepdims, f64
+     (red-case #(4 3 5) 2 (list (cons* 'a z3 (exprs-map '(dim 1) '(dim 0) '(dim 2))))
+               (list (list 'f64 #(1 4 1) (exprs-map 0 '(dim 0) 0) '(tanh (in 0)) (add-spec 'f64) #f))
+               '())
+     ;; a full reduction to rank 0
+     (red-case #(7 5) 2 (list (cons* 'a (x 'f64) row))
+               (list (list 'f64 #() (exprs-map) '(mul (in 0) (in 0)) (add-spec 'f64) #f))
+               '())
+     ;; the blocked order with a block of 3
+     (red-case #(5 7) 1 (list (cons* 'a (x 'f32) col))
+               (list (list 'f32 #(5) (exprs-map '(dim 0)) '(in 0)
+                           (make-combine-spec 'add 0.0 'f32 'blocked 3) #f))
+               '())
+     ;; the unspecified order, taken as sequential
+     (red-case #(5 7) 1 (list (cons* 'a (x 'f32) col))
+               (list (list 'f32 #(5) (exprs-map '(dim 0)) '(in 0)
+                           (make-combine-spec 'add 0.0 'f64 'unspecified) #f))
+               '())
+     ;; a finalize reading an input at the kept point
+     (red-case #(7 5) 1 (list (cons* 'a (x 'f32) row) (cons* 'b (flat-array 'f32 #(7) value2-at) (exprs-map '(dim 0))))
+               (list (list 'f32 #(7) (exprs-map '(dim 0)) '(sigmoid (in 0)) (add-spec 'f32)
+                           '(add (cast f32 (reduced)) (in 1))))
+               '())
+     ;; an s32 sum into s32, an s64 accumulator
+     (red-case #(5 7) 1 (list (cons* 'a (flat-array 's32 #(7 5) int-at) col))
+               (list (list 's32 #(5) (exprs-map '(dim 0)) '(mul (in 0) 3) (make-combine-spec 'add 0 's64) #f))
+               '())
+     ;; max of s32 values against f32 values, f64 accumulator
+     (red-case #(7 5) 1 (list (cons* 'a (flat-array 's32 #(7 5) int-at) row)
+                              (cons* 'b (y 'f32) row))
+               (list (list 'f64 #(7) (exprs-map '(dim 0)) '(add (in 0) (in 1)) (max-spec 'f64) #f))
+               '())
+     ;; an empty reduction gives the neutral element
+     (red-case #(4 0) 1 (list (cons* 'a (flat-array 'f32 #(4 0) value-at) row))
+               (list (list 'f32 #(4) (exprs-map '(dim 0)) '(in 0) (max-spec 'f32) #f))
+               '())
+     ;; the Scheme procedures max and min, over NaN, infinities and signed
+     ;; zeros, f32 and f64
+     (red-case #(7 5) 1 (list (cons* 'a (x 'f32) row))
+               (list (list 'f32 #(7) (exprs-map '(dim 0)) '(negate (in 0))
+                           (make-combine-spec (list 'opaque max) -inf.0 'f32) #f)
+                     (list 'f64 #(7) (exprs-map '(dim 0)) '(negate (in 0))
+                           (make-combine-spec (list 'opaque min) +inf.0 'f64) #f))
+               '())
+     ;; a mean followed by a Scheme + of an input, as SSA programs write it
+     (red-case #(7 5) 1 (list (cons* 'a (x 'f64) row) (cons* 'b (flat-array 'f64 #(7) value2-at) (exprs-map '(dim 0))))
+               (list (list 'f64 #(7) (exprs-map '(dim 0)) '(sigmoid (in 0)) (add-spec 'f64)
+                           `(opaque ,+ (/ (reduced) 5) (in 1))))
+               (list (list 'f64 '(sigmoid (in 0)))))
+     ;; max of s32 values with an s32 accumulator
+     (red-case #(7 5) 1 (list (cons* 'a (flat-array 's32 #(7 5) int-at) row))
+               (list (list 's32 #(7) (exprs-map '(dim 0)) '(mul (in 0) -2)
+                           (make-combine-spec (list 'opaque max) (- (expt 2 31)) 's32) #f))
+               '()))))
+
+(test-group "seg-reds"
+  (let-values (((results notes) (check-red-cases (red-cases))))
+    (for-each (lambda (name r) (test name '(segop/codegen-red #t #t) (values r)))
+              '("axis-0 sum with a stored product" "axis-1 sum with a mean"
+                "max and min with NaN" "a product" "two reduced dimensions, keepdims"
+                "a full reduction" "the blocked order" "the unspecified order"
+                "a finalize reading an input" "an s32 sum" "max of s32 + f32"
+                "an empty reduction" "Scheme max and min" "a mean then a Scheme +"
+                "Scheme max of s32")
+              results)
+    (test "every reduction kernel is made" (length results) (codegen-note notes 'kernels)))
+  ;; An accumulator that leaves its dtype is computed by the host, whose
+  ;; rounding then decides the value.
+  (let ((c (red-case #(1 4) 1 (list (cons* 'a (flat-array 's64 #(4) (lambda (i) (expt 2 30)))
+                                           (exprs-map '(dim 1))))
+                     (list (list 's32 #(1) (exprs-map '(dim 0)) '(in 0) (make-combine-spec 'add 0 's32) #f))
+                     '())))
+    (let-values (((results notes) (check-red-cases (list c))))
+      (test "an s32 accumulator out of range gives the host's value" '((segop/codegen-red #t #t))
+        (values results))))
+  ;; Thread counts split the kept points only.
+  (let* ((c (red-case #(97 13) 1 (list (cons* 'a (flat-array 'f32 #(97 13) value-at) (exprs-map '(dim 0) '(dim 1))))
+                      (list (list 'f32 #(97) (exprs-map '(dim 0)) '(sigmoid (in 0)) (add-spec 'f32) #f))
+                      '())))
+    (let-values (((sels notes) (cg-select-all (list (tcase-sg c)))))
+      (let ((ref (run-reference c)))
+        (for-each
+         (lambda (t)
+           (test-assert (sprintf "a reduction on ~a threads gives the interpreter's bits" t)
+             (parameterize ((crunch-codegen-threads t) (crunch-thread-min-chunk 1))
+               (every same-bits? (run-executor (cdr (car sels)) c) ref))))
+         '(1 2 7)))))
+  ;; Standard reductions keep their own executors.
+  (let ((c (red-case #(5 7) 1 (list (cons* 'a (flat-array 'f64 #(7 5) value-at) (exprs-map '(dim 1) '(dim 0))))
+                     (list (list 'f64 #(5) (exprs-map '(dim 0)) '(in 0) (make-combine-spec 'add 0.0 'f64) #f))
+                     '())))
+    (test-assert "a seg-red the host runs with another executor is left to it"
+      (let ((ctx (make-segop-plan-context)))
+        (parameterize ((segop-plan-context ctx) (segop-backends (cg-backends)) (crunch-codegen #t))
+          (let ((sel (select-segop-executor (tcase-sg c))))
+            (or (eq? (car sel) 'segop/codegen-red)
+                (not (memq (car sel) '(segop/strided-red segop/interpreted))))))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Group 7 - The cache and compile failures
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -464,7 +649,7 @@
         (crunch-codegen-native? (tpl '(s32 s32) '(div (in 0) (in 1)) 'f64)))
       (test "a u64 operand is not native" #f
         (crunch-codegen-native? (tpl '(u64) '(in 0) 'u64)))
-      (test "a reduction template is not native" #f
+      (test-assert "a reduction template is native"
         (crunch-codegen-native?
          (make-segop-template #(4 5) (list (tin 'f32))
                               (list (make-template-output 'f32 '(in 0) (make-combine-spec 'add 0.0 'f32) #f

@@ -50,7 +50,7 @@
           (chicken time) (chicken condition) (chicken number-vector) (chicken port)
           (chicken bitwise) (chicken pretty-print) (chicken fixnum)
           (only (chicken process-context posix) current-process-id)
-          (only (scheme base) make-parameter exact-integer?)
+          (only (scheme base) make-parameter exact-integer? vector-append)
           (only (chicken io) read-string)
           (only (chicken platform) chicken-version)
           (only (scheme time) current-jiffy jiffies-per-second)
@@ -62,6 +62,7 @@
           array-morphisms-core
           array-morphisms-activation-exec
           array-morphisms-segop
+          (only array-morphisms-scalar-ops scalar-add)
           array-morphisms-crunch-threads
           array-morphisms-crunch-translate)
   (import-for-syntax scheme (chicken base) (chicken io))
@@ -192,6 +193,26 @@
            (cons 0 'i)))
      helper-name))
 
+  ;; Body e, or #f, with each (opaque proc x ...) whose proc is one of the
+  ;; Scheme procedures of the arithmetic ops written symbolically: scalar-add
+  ;; as add, - as sub or negate, * as mul, / as div, and the generic + as
+  ;; %gadd (see crunch-translate.scm).  Other opaque parts are kept, and the
+  ;; translator rejects them.
+  (define (symbolic-body e)
+    (cond ((not (pair? e)) e)
+          ((memq (car e) '(in reduced param idx)) e)
+          ((and (eq? (car e) 'opaque) (pair? (cdr e)))
+           (let ((p (cadr e)) (args (map symbolic-body (cddr e))))
+             (cond ((and (eq? p scalar-add) (= (length args) 2)) (cons 'add args))
+                   ((and (eq? p +) (= (length args) 2)) (cons '%gadd args))
+                   ((and (eq? p -) (= (length args) 2)) (cons 'sub args))
+                   ((and (eq? p -) (= (length args) 1)) (cons 'negate args))
+                   ((and (eq? p *) (= (length args) 2)) (cons 'mul args))
+                   ((and (eq? p /) (= (length args) 2)) (cons 'div args))
+                   (else (cons 'opaque (cons p args))))))
+          ((eq? (car e) 'cast) (list 'cast (cadr e) (symbolic-body (caddr e))))
+          (else (cons (car e) (map symbolic-body (cdr e))))))
+
   ;; yes when a seg-map kernel with these bodies and dtypes can set the
   ;; failure flag, no when it cannot, and #f when the bodies are not
   ;; translated.
@@ -308,9 +329,198 @@
                                ,@(map (lambda (j) `(set! ,(o j) (+ ,(o j) (* %cnt ,(c j last))))) ops)
                                ,carry)))))))))))
 
+;;; A seg-red kernel visits the kept points [start, end), the points of
+  ;;; the first npar dimensions, in row-major order.  For each it sets the
+  ;;; accumulators to the neutral elements, walks the reduced points in
+  ;;; row-major order, computing at each the bodies of the results and of
+  ;;; the map outputs once, storing the map outputs and combining each
+  ;;; result's value into its accumulator, and then applies the finalizers
+  ;;; and stores the results.  ip holds the extents and the operand forms as
+  ;;; for a seg-map, then for each result its block size (for the blocked
+  ;;; order) and its neutral element when the accumulator has an integer
+  ;;; dtype; sc holds the neutral elements of the float accumulators.  The
+  ;;; kept points are split across threads, and each kept point is computed
+  ;;; by one thread in the order of the reference interpreter, so the
+  ;;; results are the same for every thread count.
+
+  ;; The parts of a seg-red kernel specification: its bodies field is
+  ;; (nred results map-bodies), each result a list
+  ;; (op acc-dtype order body finalize) with finalize #f for none.
+  (define (red-nred spec) (car (kspec-bodies spec)))
+  (define (red-results spec) (cadr (kspec-bodies spec)))
+  (define (red-map-bodies spec) (caddr (kspec-bodies spec)))
+
+  ;; The statements of one reduced point and of one kept point, and
+  ;; whether they can set the failure flag, from:
+  ;;   results, map-bodies: as in a seg-red kernel specification;
+  ;;   in-dts, out-dts:     the dtypes of the inputs and of the outputs
+  ;;                        (results, then map outputs);
+  ;;   read, kept-read:     the forms reading input k at the reduced point
+  ;;                        and at the kept point;
+  ;;   out-off, kept-off:   the offset forms of output j at the reduced
+  ;;                        point (map outputs) and at the kept point;
+  ;;   acc, blk, cnt, bsz:  the names of result r's accumulator, block
+  ;;                        accumulator, block count and block size;
+  ;;   init:                the form of result r's neutral element.
+  ;; Returns (point-form flush-forms final-forms fails?) or #f when some
+  ;; body is not translated.
+  (define (red-statements results map-bodies in-dts out-dts read kept-read out-off kept-off
+                          acc blk cnt bsz init)
+    (let* ((nres   (length results))
+           (in-type (lambda (k) (codegen-dtype-type (list-ref in-dts k))))
+           (input  (lambda (rd) (lambda (k) (if (< k (length in-dts)) (cons (rd k) (in-type k)) (cons 0 'i)))))
+           (tr     (translate-typed-bodies (append (map (lambda (r) (list-ref r 3)) results) map-bodies)
+                                           (input read) helper-name))
+           (fails? #f))
+      (define (note! f?) (when f? (set! fails? #t)))
+      (define (acc-type r) (codegen-dtype-type (cadr (list-ref results r))))
+      (define (combine r a v)
+        (let-values (((form f?) (typed-combine-form (car (list-ref results r)) a v
+                                                    (cadr (list-ref results r)) helper-name)))
+          (note! f?)
+          form))
+      (define (store dt atom)
+        (let-values (((form f?) (typed-store-form dt atom helper-name)))
+          (note! f?)
+          form))
+      (and tr
+           (let* ((atoms   (cadr tr))
+                  (r-atoms (list-head* atoms nres))
+                  (m-atoms (list-tail atoms nres))
+                  (point
+                   `(let* ,(car tr)
+                      ,@(map (lambda (j atom)
+                               (let ((dt (list-ref out-dts (+ nres j))))
+                                 `(,(vector-set-name dt) ,(v-name (+ (length in-dts) nres j))
+                                   ,(out-off (+ nres j)) ,(store dt atom))))
+                             (iota (length m-atoms)) m-atoms)
+                      ,@(map (lambda (r atom)
+                               (let ((a (cons (acc r) (acc-type r))) (b (cons (blk r) (acc-type r))))
+                                 (if (eq? (caddr (list-ref results r)) 'blocked)
+                                     `(begin
+                                        (set! ,(blk r) ,(combine r b atom))
+                                        (set! ,(cnt r) (+ ,(cnt r) 1))
+                                        (when (= ,(cnt r) ,(bsz r))
+                                          (set! ,(acc r) ,(combine r a b))
+                                          (set! ,(blk r) ,(init r))
+                                          (set! ,(cnt r) 0)))
+                                     `(set! ,(acc r) ,(combine r a atom)))))
+                             (iota nres) r-atoms)))
+                  (flush
+                   (filter values
+                           (map (lambda (r)
+                                  (and (eq? (caddr (list-ref results r)) 'blocked)
+                                       `(when (> ,(cnt r) 0)
+                                          (set! ,(acc r) ,(combine r (cons (acc r) (acc-type r))
+                                                                   (cons (blk r) (acc-type r)))))))
+                                (iota nres))))
+                  (finals
+                   (map (lambda (r)
+                          (let* ((res (list-ref results r))
+                                 (a   (cons (acc r) (acc-type r)))
+                                 (dt  (list-ref out-dts r))
+                                 (ftr (and (list-ref res 4)
+                                           (translate-typed-bodies (list (list-ref res 4)) (input kept-read)
+                                                                   helper-name reduced: a))))
+                            (cond ((not (list-ref res 4))
+                                   `(,(vector-set-name dt) ,(v-name (+ (length in-dts) r)) ,(kept-off r)
+                                     ,(store dt a)))
+                                  (ftr
+                                   (note! (caddr ftr))
+                                   `(let* ,(car ftr)
+                                      (,(vector-set-name dt) ,(v-name (+ (length in-dts) r)) ,(kept-off r)
+                                       ,(store dt (car (cadr ftr))))))
+                                  (else #f))))
+                        (iota nres))))
+             (note! (caddr tr))
+             (and (every values finals)
+                  (list point flush finals fails?))))))
+
+  (define (list-head* lst n) (if (= n 0) '() (cons (car lst) (list-head* (cdr lst) (- n 1)))))
+
+  (define (v-name j) (sym "%v" j))
+
+  (define (red-kernel-forms k spec)
+    (let* ((rank    (kspec-rank spec))
+           (nred    (red-nred spec))
+           (npar    (- rank nred))
+           (results (red-results spec))
+           (nres    (length results))
+           (ins     (kspec-in-dtypes spec))
+           (outs    (kspec-out-dtypes spec))
+           (n       (length ins))
+           (nops    (+ n (length outs)))
+           (name    (sym "am_g" id-placeholder "_k" k))
+           (e       (lambda (d) (sym "%e" d)))
+           (b       (lambda (j) (sym "%b" j)))
+           (c       (lambda (j d) (sym "%c" j "_" d)))
+           (i       (lambda (d) (sym "%i" d)))
+           (po      (lambda (j) (sym "%po" j)))
+           (ops     (iota nops))
+           (dims    (iota rank))
+           (pdims   (iota npar))
+           (rdims   (map (lambda (d) (+ npar d)) (iota nred)))
+           (dt-of   (lambda (j) (if (< j n) (list-ref ins j) (list-ref outs (- j n)))))
+           (rbase   (+ rank (* nops (+ rank 1))))
+           (acc     (lambda (r) (sym "%acc" r)))
+           (blk     (lambda (r) (sym "%blk" r)))
+           (cnt     (lambda (r) (sym "%cnt" r)))
+           (bsz     (lambda (r) (sym "%bs" r)))
+           (init    (lambda (r)
+                      (if (codegen-float-dtype? (cadr (list-ref results r)))
+                          `(f64vector-ref sc ,r)
+                          `(s64vector-ref ip ,(+ rbase (* 2 r) 1)))))
+           ;; offset of operand j at the current reduced point
+           (off     (lambda (j) (sum-form (cons (po j) (map (lambda (d) `(* ,(c j d) ,(i d))) rdims)))))
+           (st      (red-statements results (red-map-bodies spec) ins outs
+                                    (lambda (j) `(,(vector-ref-name (dt-of j)) ,(v-name j) ,(off j)))
+                                    (lambda (j) `(,(vector-ref-name (dt-of j)) ,(v-name j) ,(po j)))
+                                    (lambda (j) (off (+ n j)))
+                                    (lambda (j) (po (+ n j)))
+                                    acc blk cnt bsz init))
+           (params  (append (map (lambda (d) (list (e d) `(s64vector-ref ip ,d))) dims)
+                            (apply append
+                                   (map (lambda (j)
+                                          (let ((at (+ rank (* j (+ rank 1)))))
+                                            (cons (list (b j) `(s64vector-ref ip ,at))
+                                                  (map (lambda (d) (list (c j d) `(s64vector-ref ip ,(+ at 1 d))))
+                                                       dims))))
+                                        ops))
+                            (map (lambda (r) (list (bsz r) `(s64vector-ref ip ,(+ rbase (* 2 r))))) (iota nres))))
+           (loops   (let loop ((ds rdims))
+                      (if (null? ds)
+                          (car st)
+                          `(do ((,(i (car ds)) 0 (+ ,(i (car ds)) 1))) ((= ,(i (car ds)) ,(e (car ds))))
+                             ,(loop (cdr ds)))))))
+      (list
+       `(: (,name integer integer s64vector f64vector ,@(map (lambda (j) (vector-type (dt-of j))) ops)) void)
+       `(define (,name start end ip sc ,@(map v-name ops))
+          (let* ,params
+            (do ((%p start (+ %p 1))) ((= %p end))
+              ;; The kept indices are computed without assignment: crunch
+              ;; loses the initial value of a variable that is bound to
+              ;; another variable and assigned later.
+              (let* (,@(apply append
+                              (map (lambda (d)
+                                     (let ((q (if (= d (- npar 1)) '%p (sym "%q" (+ d 1)))))
+                                       `((,(i d) (remainder ,q ,(e d)))
+                                         (,(sym "%q" d) (quotient ,q ,(e d))))))
+                                   (reverse pdims))))
+                (let* (,@(map (lambda (j)
+                                (list (po j) (sum-form (cons (b j) (map (lambda (d) `(* ,(c j d) ,(i d))) pdims)))))
+                              ops)
+                       ,@(apply append
+                                (map (lambda (r) (list (list (acc r) (init r)) (list (blk r) (init r))
+                                                       (list (cnt r) 0)))
+                                     (iota nres))))
+                  ,loops
+                  ,@(cadr st)
+                  ,@(caddr st)))))))))
+
   (define (kernel-forms k spec)
     (case (kspec-kind spec)
       ((map) (map-kernel-forms k spec))
+      ((red) (red-kernel-forms k spec))
       (else (error 'crunch-codegen "unknown kernel kind" (kspec-kind spec)))))
 
   ;; The C run procedure of kernel k (see crunch-dispatch-n.h).
@@ -534,7 +744,8 @@
   ;; slots of the kernel's inputs, ip its integer parameters and esz the
   ;; element sizes of its operands; host is the executor that computes the
   ;; segop when the kernel sets its failure flag.
-  (define (kernel-executor kern may-fail? npoints refs n-outs ip esz host)
+  (define (kernel-executor kern may-fail? npoints refs n-outs ip sc esz host
+                           #!optional (work-per-point 1))
     (let* ((run  (vector-ref kern 0))
            (flag (vector-ref kern 1))
            (n    (length refs))
@@ -550,8 +761,8 @@
               (vector-set! vecs k (car bs))
               (loop (+ k 1) (cdr bs))))
           (when may-fail? (flag-clear! flag))
-          (crunch-dispatch-n npoints ip no-scalars vecs esz run (kernel-threads)
-                             (crunch-thread-min-chunk))
+          (crunch-dispatch-n npoints ip sc vecs esz run (kernel-threads)
+                             (max 1 (quotient (crunch-thread-min-chunk) work-per-point)))
           (when (and may-fail? (not (= 0 (flag-ref flag))))
             (flag-clear! flag)
             (if (null? extra-bufs) (host deref buf) (host deref buf extra-bufs)))))))
@@ -597,9 +808,20 @@
 
   (define max-rank 6)
 
+  ;; The linear forms of ops over a space of the given rank, each with one
+  ;; coefficient per dimension, or #f.  The form of a reduced result's
+  ;; output may have been computed over the kept dimensions only (it is
+  ;; cached in the operand), so its coefficient vector is padded with zeros
+  ;; for the reduced dimensions.
   (define (linear-forms ops rank)
     (let ((ls (map (lambda (o) (segop-operand-linear o rank)) ops)))
-      (and (every values ls) ls)))
+      (and (every values ls)
+           (map (lambda (l)
+                  (let ((k (vector-length (cdr l))))
+                    (if (< k rank)
+                        (cons (car l) (vector-append (cdr l) (make-vector (- rank k) 0)))
+                        l)))
+                ls))))
 
   ;; The integer parameters of a kernel over space whose operands have the
   ;; linear forms lins.
@@ -616,7 +838,7 @@
            (m    (length outs)))
       (and (<= rank max-rank)
            (every (lambda (o) (memq (segop-operand-dtype o) codegen-dtypes)) (append ins outs))
-           (let-values (((canon order) (canonical-scalar-body (cons '%outs bodies))))
+           (let-values (((canon order) (canonical-scalar-body (cons '%outs (map symbolic-body bodies)))))
              (let* ((cins   (map (lambda (k) (list-ref ins k)) order))
                     (in-dts (map segop-operand-dtype cins))
                     (out-dts (map segop-operand-dtype outs))
@@ -639,17 +861,131 @@
                                                       cell
                                                       (kernel-executor kern fails? (shape-size space)
                                                                        (map segop-operand-slot cins) m
-                                                                       (kernel-ip space lins)
+                                                                       (kernel-ip space lins) no-scalars
                                                                        (kernel-esz (append in-dts out-dts))
                                                                        (cdr host)))))
                                              (car batch)))
                              (cons 'segop/codegen-map (segop-executor-cell-executor cell)))))))))))
+
+  (define max-red-rank 8)
+
+  ;; The combine specs a generated kernel follows: the unspecified order is
+  ;; taken as sequential, as the host executors of non-standard seg-reds
+  ;; take it.
+  (define (red-spec-ok? spec)
+    (and (spec-op spec)
+         (memq (combine-spec-acc-dtype spec) codegen-dtypes)))
+
+  ;; The combine op a kernel computes for spec, or #f.  The Scheme
+  ;; procedures max and min, written (opaque max) and (opaque min), skip a
+  ;; NaN argument where the max and min ops keep the accumulator; the two
+  ;; agree because the accumulator starts at a neutral element that is not
+  ;; NaN and a NaN value never replaces it, so it is never NaN.
+  (define (spec-op spec)
+    (let ((op (combine-spec-op spec)))
+      (cond ((memq op '(add mul max min)) op)
+            ((and (pair? op) (eq? (cadr op) max)) 'max)
+            ((and (pair? op) (eq? (cadr op) min)) 'min)
+            (else #f))))
+
+  (define (spec-order spec)
+    (if (eq? (combine-spec-order spec) 'blocked) 'blocked 'sequential))
+
+  ;; The canonical form of a seg-red's bodies: the list (results
+  ;; map-bodies) of a kernel specification, and the input order, as two
+  ;; values.
+  (define (canonical-red results map-bodies)
+    (let-values (((canon order)
+                  (canonical-scalar-body
+                   `(%red (%results ,@(map (lambda (r) `(%result ,(car r) ,(or (cadr r) '%none))) results))
+                          (%maps ,@map-bodies)))))
+      (values (list (map (lambda (x) (list (cadr x) (if (eq? (caddr x) '%none) #f (caddr x))))
+                         (cdadr canon))
+                    (cdaddr canon))
+              order)))
+
+  ;; yes, no or #f, as map-may-fail? does, for a seg-red kernel.
+  (define (red-may-fail? results map-bodies in-dts out-dts)
+    (let* ((z  (lambda (j) 0))
+           (st (red-statements results map-bodies in-dts out-dts z z z z
+                               (lambda (r) 'a) (lambda (r) 'b) (lambda (r) 'c) (lambda (r) 'd)
+                               (lambda (r) 0))))
+      (and st (if (cadddr st) 'yes 'no))))
+
+  (define (red-select sg space nred ins results map-outs)
+    (let* ((rank (vector-length space))
+           (outs (append (map red-result-out results) (map car map-outs)))
+           (host (select-segop-executor sg 'crunch-codegen)))
+      (and host
+           ;; standard reductions and contractions keep their own executors
+           (memq (car host) '(segop/strided-red segop/interpreted))
+           (<= rank max-red-rank)
+           (every (lambda (o) (memq (segop-operand-dtype o) codegen-dtypes)) (append ins outs))
+           (every (lambda (r) (red-spec-ok? (red-result-combine r))) results)
+           (let-values (((canon order)
+                         (canonical-red (map (lambda (r) (list (symbolic-body (red-result-body r))
+                                                                (symbolic-body (red-result-finalize r))))
+                                             results)
+                                        (map (lambda (mo) (symbolic-body (cdr mo))) map-outs))))
+             (let* ((cins    (map (lambda (k) (list-ref ins k)) order))
+                    (in-dts  (map segop-operand-dtype cins))
+                    (out-dts (map segop-operand-dtype outs))
+                    (kres    (map (lambda (r cr)
+                                    (let ((spec (red-result-combine r)))
+                                      (list (spec-op spec) (combine-spec-acc-dtype spec)
+                                            (spec-order spec) (car cr) (cadr cr))))
+                                  results (car canon)))
+                    (kbodies (list nred kres (cadr canon)))
+                    (lins    (linear-forms (append cins outs) rank))
+                    (fails   (and lins (<= (+ (length cins) (length outs)) crunch-dispatch-n-max-vectors)
+                                  (red-may-fail? kres (cadr canon) in-dts out-dts))))
+               (and fails
+                    (let* ((spec (make-kspec 'red rank in-dts out-dts kbodies
+                                             (kspec-key-string 'red rank in-dts out-dts kbodies)))
+                           (cell (make-segop-executor-cell (cdr host)))
+                           (npar (- rank nred))
+                           (ip   (list->s64vector
+                                  (append (s64vector->list (kernel-ip space lins))
+                                          (apply append
+                                                 (map (lambda (r)
+                                                        (let ((spec (red-result-combine r)))
+                                                          (list (or (combine-spec-block-size spec) 1)
+                                                                (if (codegen-float-dtype? (combine-spec-acc-dtype spec))
+                                                                    0
+                                                                    (round-to-dtype (combine-spec-neutral spec)
+                                                                                    (combine-spec-acc-dtype spec))))))
+                                                      results)))))
+                           (sc   (list->f64vector
+                                  (map (lambda (r)
+                                         (let ((spec (red-result-combine r)))
+                                           (if (codegen-float-dtype? (combine-spec-acc-dtype spec))
+                                               (exact->inexact (round-to-dtype (combine-spec-neutral spec)
+                                                                               (combine-spec-acc-dtype spec)))
+                                               0.0)))
+                                       results)))
+                           (batch (plan-batch)))
+                      (set-car! batch
+                                (cons (cons spec
+                                            (lambda (kern)
+                                              (segop-executor-cell-set!
+                                               cell
+                                               (kernel-executor kern (eq? fails 'yes)
+                                                                (shape-size (subvector space 0 npar))
+                                                                (map segop-operand-slot cins) (length outs)
+                                                                ip (if (= 0 (f64vector-length sc)) no-scalars sc)
+                                                                (kernel-esz (append in-dts out-dts))
+                                                                (cdr host)
+                                                                (max 1 (shape-size (subvector space npar rank)))))))
+                                      (car batch)))
+                      (cons 'segop/codegen-red (segop-executor-cell-executor cell)))))))))
 
   (define (codegen-select sg)
     (and (crunch-codegen)
          (segop-plan-context)
          (cases segop sg
            (seg-map (space ins outs bodies fallback) (map-select sg space ins outs bodies))
+           (seg-red (space nred ins results map-outs fallback)
+             (and (> nred 0) (red-select sg space nred ins results map-outs)))
            (else #f))))
 
   ;;;; ============================================================
@@ -666,10 +1002,47 @@
   (define (crunch-codegen-native? tpl)
     "The native-capability query of the backend: true, while crunch-codegen
     is true, when segop template tpl is a seg-map with affine maps over a
-    space of rank at most 6, operands of the dtypes f32, f64, s32, s64 and
-    u32, and bodies the typed translator accepts."
+    space of rank at most 6, or a seg-red (other than a GEMM) with affine
+    maps over a space of rank at most 8 whose results combine with add,
+    mul, max or min; its operands have the dtypes f32, f64, s32, s64 and
+    u32, and the typed translator accepts its bodies."
     (and (crunch-codegen)
-         (= (segop-template-nred tpl) 0)
+         (if (= (segop-template-nred tpl) 0)
+             (map-template-native? tpl)
+             (red-template-native? tpl))))
+
+  (define (red-template-native? tpl)
+    (let* ((space (segop-template-space tpl))
+           (rank  (vector-length space))
+           (nred  (segop-template-nred tpl))
+           (ins   (segop-template-ins tpl))
+           (outs  (segop-template-outs tpl))
+           (res   (filter template-output-combine outs))
+           (mos   (filter (lambda (o) (not (template-output-combine o))) outs))
+           (in-dts (map template-input-dtype ins)))
+      (and (<= rank max-red-rank)
+           (pair? res)
+           (every (lambda (o) (combine-spec? (template-output-combine o))) res)
+           (every (lambda (o) (red-spec-ok? (template-output-combine o))) res)
+           (<= (+ (length ins) (length outs)) crunch-dispatch-n-max-vectors)
+           (every (lambda (dt) (memq dt codegen-dtypes))
+                  (append in-dts (map template-output-dtype outs)))
+           (every (lambda (i) (affine-map? (template-input-map i) rank)) ins)
+           (every (lambda (o) (or (not (template-output-map o))
+                                  (affine-map? (template-output-map o) rank)))
+                  outs)
+           (red-may-fail? (map (lambda (o)
+                                 (let ((spec (template-output-combine o)))
+                                   (list (spec-op spec) (combine-spec-acc-dtype spec)
+                                         (spec-order spec) (symbolic-body (template-output-body o))
+                                         (symbolic-body (template-output-finalize o)))))
+                               res)
+                          (map (lambda (o) (symbolic-body (template-output-body o))) mos)
+                          in-dts
+                          (map template-output-dtype (append res mos)))
+           #t)))
+
+  (define (map-template-native? tpl)
          (let* ((space (segop-template-space tpl))
                 (rank  (vector-length space))
                 (ins   (segop-template-ins tpl))
@@ -683,9 +1056,9 @@
                 (every (lambda (o) (or (not (template-output-map o))
                                        (affine-map? (template-output-map o) rank)))
                        outs)
-                (map-may-fail? (map template-output-body outs) in-dts
+                (map-may-fail? (map (lambda (o) (symbolic-body (template-output-body o))) outs) in-dts
                                (map template-output-dtype outs))
-                #t))))
+                #t)))
 
   ;;;; ============================================================
   ;;;; Registration
