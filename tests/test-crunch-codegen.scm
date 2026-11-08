@@ -185,6 +185,9 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (test-group "selection"
+  (test "the code generator is on unless AM_CRUNCH_CODEGEN is \"\" or \"0\""
+    (not (member (get-environment-variable "AM_CRUNCH_CODEGEN") '("" "0")))
+    (crunch-codegen))
   (let ((c (map-case #(4) (list (cons 'a (flat-array 'f32 #(4) value-at))) '((exp (in 0))) '(f32) #t)))
     (test "outside a plan the backend declines" 'segop/flat-unary
       (parameterize ((segop-backends (cg-backends)) (crunch-codegen #t))

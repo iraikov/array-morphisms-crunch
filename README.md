@@ -13,10 +13,12 @@ dispatch, boxing or allocation in their inner loops.
 | Module | Contents |
 |---|---|
 | `array-morphisms-crunch-activations` | f32/f64 kernels for `relu`, `sigmoid`, `tanh` and their SSA derivative ops, and for `exp`, `log`, `sqrt`, `negate`, `abs`; row softmax (`crunch-softmax-rows-f32`/`-f64`) and interleaved rotary embedding (`crunch-rope-f32`/`-f64`); binary kernels for `add`, `sub`, `mul`, `div`; axis-0 and axis-1 reductions (`sum`, `mean`, `max`, `min`); a strided copy; `make-crunch-activation-backend` and `make-crunch-threaded-activation-backend` |
-| `array-morphisms-crunch-threads` | the POSIX-thread dispatchers for chunk kernels (`crunch-dispatch-f32`, `crunch-dispatch-f64`, `crunch-dispatch4-f32`, `crunch-dispatch4-f64`), their settings, and the persistent worker pool they share |
+| `array-morphisms-crunch-threads` | the POSIX-thread dispatchers for chunk kernels (`crunch-dispatch-f32`, `crunch-dispatch-f64`, `crunch-dispatch4-f32`, `crunch-dispatch4-f64`, and `crunch-dispatch-n` for generated kernels), their settings, and the persistent worker pool they share |
 | `array-morphisms-crunch-blas-backend` | `crunch-{s,d}gemm`, `-gemm-strided`, `-gemv`, `-dot`, `-axpy` with the normalized signatures of `array-morphisms-blas-exec`; `crunch-native-build?` |
 | `array-morphisms-crunch-conv-backend` | NCHW/NHWC `im2col`, `col2im`, `bias-add`, the six convolution hooks, and `make-crunch-blas-backend` (the complete `blas-backend` record) |
 | `array-morphisms-crunch-optimizers` | `crunch-adam-f32` and `crunch-adam-f64`, whole-vector Adam updates for nanograd's optimizer-kernel registry |
+| `array-morphisms-crunch-codegen` | a segop backend that generates, compiles and runs a kernel for each segop of a replay plan (see Code generation) |
+| `array-morphisms-crunch-translate` | the translation of segop bodies into crunch Scheme, shared by the generated kernels |
 
 ## Usage
 
@@ -213,6 +215,92 @@ values while they are still in cache. A column-sum kernel must also run
 on one thread, since splitting the rows would change the order of the
 additions.
 
+## Code generation
+
+The fused kernels above are a fixed catalogue. The module
+`array-morphisms-crunch-codegen` instead writes a kernel for each segop
+of a replay plan, from the segop's body and index maps, and compiles it
+with crunch. It is a segop backend of kind `codegen`. Register it after
+the other backends:
+
+```scheme
+(import array-morphisms-crunch-codegen)
+(register-crunch-codegen-backend!)
+```
+
+It is placed after the registry backend, so the BLAS and catalogue
+kernels keep the segops they already run, and before the Scheme backend,
+so it takes many of the segops that would otherwise run as Scheme loops.
+
+What it runs:
+
+- element-wise maps, with one or several outputs, over spaces of up to
+  rank 6, whose operands are read through identities, broadcasts,
+  transposes and other strided views;
+- reductions over spaces of up to rank 8 that combine with add, mul, max
+  or min, with the map that the fusion pass put inside them and the
+  final step it put after them;
+- matrix products with an epilogue: the product is computed by the BLAS
+  backend, and the epilogue runs as a generated kernel over the stored
+  product.
+
+The operands may be f32, f64, s32, s64 or u32, mixed as the body needs.
+A kernel is fixed in the rank of its space, its bodies and its dtypes;
+extents, offsets and strides are passed when it runs, so one kernel
+serves every batch size and layout.
+
+**Results.** A generated kernel computes the same values as the Scheme
+code it replaces, bit for bit. It rounds intermediate values where the
+body says so, adds in the same order, and follows Scheme's arithmetic
+on mixed integers and floats. A reduction keeps each output point's
+additions in order; it computes up to 8 neighbouring output points
+together, each with its own accumulator, so that sums over the rows of
+a matrix read memory in order. When an integer result would leave the
+range of its dtype, the kernel stops and the segop runs on the host for
+that call. Kernels are split across threads like the threaded
+activation kernels, and their results do not depend on the number of
+threads.
+
+**When kernels are compiled.** The kernels of a plan are compiled
+together, as one module, when the plan is compiled, which is at the
+second step of a program run through `ssa-realize/ctx`. This takes
+under a second for a small network. Compiled modules are kept in a
+cache directory, under a name derived from their source, so later
+processes load them instead of compiling them again.
+
+**Requirements.** Compiling needs `csc` and the C compiler it uses at
+run time. If a module cannot be compiled, its segops run on the
+backends after the code generator, and a warning is written.
+
+**Settings.**
+
+| Setting | Meaning |
+|---|---|
+| `crunch-codegen` | `#t` (the default) to use the backend; the environment variable `AM_CRUNCH_CODEGEN=0` makes the default `#f` |
+| `crunch-codegen-fusions` | the fusion classes whose fused segops the backend reports as native to the fusion pass; default `(redomap epilogue)`, or the classes named in `AM_CRUNCH_CODEGEN_FUSIONS` |
+| `crunch-codegen-threads` | the number of threads a kernel runs on; `#f` (the default) follows the activation backend: the crunch thread count with the threaded backend, otherwise one |
+| `crunch-codegen-cache-directory` | the cache directory; default `AM_CRUNCH_CODEGEN_CACHE`, else `$XDG_CACHE_HOME/array-morphisms/kernels`, else `~/.cache/array-morphisms/kernels`; `#f` keeps no cache |
+| `crunch-codegen-csc` | the `csc` program used to compile |
+
+The fusion classes come from array-morphisms: `map` (a map into a map),
+`kept`, `horizontal`, `redomap` (a map into a reduction), `epilogue` (a
+map after a reduction) and `gemm-epilogue`. Under the default fusion
+policy, the pass fuses only what some backend reports as native. The
+default classes fuse passes over the same data into one kernel. A map
+fused into a map can take the producer of a matrix product's epilogue,
+so that class is left to the catalogue unless asked for. Under the
+policy `'all`, every legal fusion is made, and the code generator runs
+the fused segops of every class.
+
+**Reports.** The timing profile and `replay-plan-stats` name the
+generated kernels `segop/codegen-map`, `segop/codegen-red` and
+`segop/codegen-epilogue`. `replay-plan-stats` also reports, under
+`crunch-codegen`, how many of the plan's segops became kernels, and how
+many of those were compiled, loaded from the cache, or could not be
+compiled. `crunch-codegen-stats` gives the same totals for the whole
+process, and `crunch-codegen-forget-kernels!` makes the next plan load
+or compile its kernels again.
+
 ## Row softmax and rotary embedding
 
 These kernels have no morphism op. They are called directly, on
@@ -407,6 +495,9 @@ on:
 
 They are kept as regression checks against future crunch or CHICKEN releases.
 `tests/run.scm` runs the activation (including the binary, reduction and copy
-kernels), BLAS, convolution, threading and optimizer suites.
+kernels), BLAS, convolution, threading, optimizer and code generation
+suites. The code generation tests compare every generated kernel with the
+reference interpreter of array-morphisms and with the Scheme executor it
+replaces, bit for bit.
 `tests/bench-threaded-activations.scm` is an informational benchmark;
 compile it with `csc -O3`.

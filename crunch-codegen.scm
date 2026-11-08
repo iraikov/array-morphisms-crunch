@@ -25,14 +25,13 @@
 ;;; compiling them again.
 ;;;
 ;;; The backend is used only while the parameter crunch-codegen is true;
-;;; its default is true when the environment variable AM_CRUNCH_CODEGEN is
-;;; set to a value other than "" or "0".  It reports to the fusion pass the
+;;; its default is true unless the environment variable AM_CRUNCH_CODEGEN
+;;; is set to "" or "0".  It reports to the fusion pass the
 ;;; fused segops it can generate, so that the default fusion policy makes
 ;;; them, for the fusion classes listed in crunch-codegen-fusions.
 ;;;
 ;;;   (import array-morphisms-crunch-codegen)
 ;;;   (register-crunch-codegen-backend!)
-;;;   (crunch-codegen #t)
 
 (module array-morphisms-crunch-codegen
 
@@ -76,9 +75,10 @@
   ;;;; Settings
   ;;;; ============================================================
 
+  ;; True unless the environment variable name is set to "" or "0".
   (define (env-flag? name)
     (let ((v (get-environment-variable name)))
-      (and v (not (member v '("" "0"))) #t)))
+      (not (and v (member v '("" "0")) #t))))
 
   ;; True while the backend takes segops and answers native queries.
   (define crunch-codegen (make-parameter (env-flag? "AM_CRUNCH_CODEGEN")
@@ -103,9 +103,9 @@
   ;; The fusion classes (see segop templates in array-morphisms) whose
   ;; fused segops the backend reports as native, so that the default fusion
   ;; policy makes them: a list of map, kept, horizontal, redomap, epilogue
-  ;; and gemm-epilogue (default: redomap and epilogue).  The segops of the other classes are not fused
-  ;; under the default policy; under the policy all they are fused and
-  ;; still run as generated kernels.
+  ;; and gemm-epilogue (default: redomap and epilogue).  The segops of
+  ;; the other classes are not fused under the default policy; under the
+  ;; policy all they are fused and still run as generated kernels.
   (define all-fusion-classes '(map kept horizontal redomap epilogue gemm-epilogue))
 
   ;; The default: the classes named in the environment variable
