@@ -20,6 +20,7 @@
 ;;;   Group 5 - Mixed and integer dtypes, and the failure fallback
 ;;;   Group 6 - Thread counts
 ;;;   Group 6b - seg-reds, against the interpreter and the host executor
+;;;   Group 6c - GEMM epilogues, against fusion off
 ;;;   Group 7 - The cache and compile failures
 ;;;   Group 8 - Native queries and SSA programs
 
@@ -30,6 +31,8 @@
         datatype
         array-morphisms-core
         array-morphisms-basic-ops
+        (only array-morphisms-blas-exec morph-matmul)
+        (only array-morphisms-structural-ops morph-transpose)
         array-morphisms-context
         array-morphisms-segop
         array-morphisms-scalar-ops
@@ -597,6 +600,80 @@
           (let ((sel (select-segop-executor (tcase-sg c))))
             (or (eq? (car sel) 'segop/codegen-red)
                 (not (memq (car sel) '(segop/strided-red segop/interpreted))))))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Group 6c - GEMM epilogues
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; The values of the forward program of morphism m (made by make), replayed
+;; twice after its trace, and the segop tags of its plan, under fusion
+;; policy policy with the code generator on or off.
+(define (forward-replays make policy codegen?)
+  (parameterize ((segop-fusion policy) (crunch-codegen codegen?)
+                 (segop-backends (parameterize ((segop-backends (segop-backends)))
+                                   (register-crunch-codegen-backend!)
+                                   (segop-backends))))
+    (let* ((prog (morphism-to-ssa (am:make-var (make) #f)))
+           (ctx  (make-morphism-context))
+           (vals (lambda (r)
+                   (cases array-morphism r
+                     (concrete-array (d shape strides offset dt _ _)
+                       (map (lambda (i) (typed-vector-ref d dt (+ offset i))) (iota (shape-size shape))))
+                     (else #f)))))
+      (ssa-realize/ctx ctx prog)
+      (finalize-context! ctx)
+      (reset-context! ctx)
+      (let ((r1 (vals (car (ssa-realize/ctx ctx prog)))))
+        (reset-context! ctx)
+        (let ((r2 (vals (car (ssa-realize/ctx ctx prog)))))
+          (list r1 r2 (map car (cdr (assq 'counts (replay-plan-stats prog))))))))))
+
+(define (gemm-arr dt shape f) (morph-from-list (map f (iota (apply * shape))) (list->vector shape) dt))
+
+(test-group "GEMM epilogues"
+  (for-each
+   (lambda (dt)
+     (let* ((x  (lambda () (gemm-arr dt '(6 5) value-at)))
+            (xt (lambda () (gemm-arr dt '(5 6) value2-at)))
+            (W  (lambda () (gemm-arr dt '(5 9) (lambda (i) (* 0.3 (sin (+ i 1.0)))))))
+            (y  (lambda () (gemm-arr dt '(6 9) value2-at)))
+            (b  (lambda () (gemm-arr dt '(9) (lambda (i) (- (* 0.1 i) 0.4)))))
+            (cases
+             (list
+              (cons "a full-shape input"
+                    (lambda () (morph* (morph-matmul (x) (W)) (y))))
+              (cons "the product as the second operand"
+                    (lambda () (morph- (y) (morph-matmul (x) (W)))))
+              (cons "a chain over the product, a bias and an input"
+                    (lambda () (morph-sigmoid (morph* (morph+ (morph-matmul (x) (W)) (b)) (y)))))
+              (cons "a transposed operand"
+                    (lambda () (morph* (morph-matmul (morph-transpose (xt) '(1 0)) (W)) (y)))))))
+       (for-each
+        (lambda (c)
+          (let ((off (forward-replays (cdr c) #f #f))
+                (all (forward-replays (cdr c) 'all #t)))
+            (test-assert (sprintf "~a ~a: runs as a GEMM with a generated epilogue" dt (car c))
+              (memq 'segop/codegen-epilogue (caddr all)))
+            (test-assert (sprintf "~a ~a: the replays equal fusion off" dt (car c))
+              (every (lambda (x y) (every same-element? x y))
+                     (list (car off) (cadr off)) (list (car all) (cadr all))))))
+        cases)))
+   '(f32 f64))
+  (let* ((W  (gemm-arr 'f32 '(5 9) (lambda (i) (* 0.3 (sin (+ i 1.0))))))
+         (tin (lambda (dt m) (make-template-input dt m #t)))
+         (gemm (lambda (fin extras)
+                 (make-segop-template
+                  #(6 9 5)
+                  (append (list (tin 'f32 (exprs-map '(dim 0) '(dim 2))) (tin 'f32 (exprs-map '(dim 2) '(dim 1))))
+                          extras)
+                  (list (make-template-output 'f32 '(mul (in 0) (in 1)) 'gemm fin (exprs-map '(dim 0) '(dim 1))))
+                  1))))
+    (parameterize ((crunch-codegen #t))
+      (test-assert "a GEMM with a map epilogue is native"
+        (crunch-codegen-native? (gemm '(mul (cast f32 (reduced)) (in 2))
+                                      (list (tin 'f32 (exprs-map '(dim 0) '(dim 1)))))))
+      (test "a GEMM without an epilogue is not native" #f
+        (crunch-codegen-native? (gemm #f '()))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Group 7 - The cache and compile failures

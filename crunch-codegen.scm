@@ -63,6 +63,8 @@
           array-morphisms-activation-exec
           array-morphisms-segop
           (only array-morphisms-scalar-ops scalar-add)
+          (only array-morphisms-blas-exec execute-gemm-plan/into!)
+          (only array-morphisms-ssa standard-gemm)
           array-morphisms-crunch-threads
           array-morphisms-crunch-translate)
   (import-for-syntax scheme (chicken base) (chicken io))
@@ -754,7 +756,8 @@
       (lambda (deref buf #!optional (extra-bufs '()))
         (unless (= npoints 0)
           (do ((k 0 (fx+ k 1))) ((fx= k n))
-            (vector-set! vecs k (operand-data (deref (vector-ref refv k)))))
+            (let ((r (vector-ref refv k)))
+              (vector-set! vecs k (if (eq? r product-slot) buf (operand-data (deref r))))))
           (vector-set! vecs n buf)
           (let loop ((k (+ n 1)) (bs extra-bufs))
             (when (pair? bs)
@@ -812,15 +815,17 @@
   ;; coefficient per dimension, or #f.  The form of a reduced result's
   ;; output may have been computed over the kept dimensions only (it is
   ;; cached in the operand), so its coefficient vector is padded with zeros
-  ;; for the reduced dimensions.
+  ;; for the reduced dimensions; a GEMM epilogue's input, whose form may
+  ;; have been computed over the GEMM's space, keeps its first rank
+  ;; coefficients.
   (define (linear-forms ops rank)
     (let ((ls (map (lambda (o) (segop-operand-linear o rank)) ops)))
       (and (every values ls)
            (map (lambda (l)
                   (let ((k (vector-length (cdr l))))
-                    (if (< k rank)
-                        (cons (car l) (vector-append (cdr l) (make-vector (- rank k) 0)))
-                        l)))
+                    (cond ((< k rank) (cons (car l) (vector-append (cdr l) (make-vector (- rank k) 0))))
+                          ((> k rank) (cons (car l) (subvector (cdr l) 0 rank)))
+                          (else l))))
                 ls))))
 
   ;; The integer parameters of a kernel over space whose operands have the
@@ -833,8 +838,16 @@
   (define (kernel-esz dtypes) (list->s32vector (map element-size dtypes)))
 
   (define (map-select sg space ins outs bodies)
+    (let ((host (select-segop-executor sg 'crunch-codegen)))
+      (and host (map-request space ins outs bodies host 'segop/codegen-map (lambda (exec) exec)))))
+
+  ;; Requests a seg-map kernel over space with operands ins and outs and one
+  ;; body per output, for a segop whose executor in the backends after this
+  ;; one is host, a pair (tag . executor).  Returns (tag . executor), an
+  ;; executor cell's, or #f when the kernel cannot be generated.  When the
+  ;; kernel is made, the cell gets (wrap kernel-executor).
+  (define (map-request space ins outs bodies host tag wrap)
     (let* ((rank (vector-length space))
-           (n    (length ins))
            (m    (length outs)))
       (and (<= rank max-rank)
            (every (lambda (o) (memq (segop-operand-dtype o) codegen-dtypes)) (append ins outs))
@@ -849,23 +862,69 @@
                     (map-may-fail? cbodies in-dts out-dts)
                     (let* ((spec (make-kspec 'map rank in-dts out-dts cbodies
                                              (kspec-key-string 'map rank in-dts out-dts cbodies)))
-                           (host (select-segop-executor sg 'crunch-codegen))
-                           (cell (and host (make-segop-executor-cell (cdr host))))
-                           (fails? (eq? 'yes (map-may-fail? cbodies in-dts out-dts))))
-                      (and cell
-                           (let ((batch (plan-batch)))
-                             (set-car! batch
-                                       (cons (cons spec
-                                                   (lambda (kern)
-                                                     (segop-executor-cell-set!
-                                                      cell
-                                                      (kernel-executor kern fails? (shape-size space)
-                                                                       (map segop-operand-slot cins) m
-                                                                       (kernel-ip space lins) no-scalars
-                                                                       (kernel-esz (append in-dts out-dts))
-                                                                       (cdr host)))))
-                                             (car batch)))
-                             (cons 'segop/codegen-map (segop-executor-cell-executor cell)))))))))))
+                           (cell (make-segop-executor-cell (cdr host)))
+                           (fails? (eq? 'yes (map-may-fail? cbodies in-dts out-dts)))
+                           (batch (plan-batch)))
+                      (set-car! batch
+                                (cons (cons spec
+                                            (lambda (kern)
+                                              (segop-executor-cell-set!
+                                               cell
+                                               (wrap
+                                                (kernel-executor kern fails? (shape-size space)
+                                                                 (map segop-operand-slot cins) m
+                                                                 (kernel-ip space lins) no-scalars
+                                                                 (kernel-esz (append in-dts out-dts))
+                                                                 (cdr host))))))
+                                      (car batch)))
+                      (cons tag (segop-executor-cell-executor cell)))))))))
+
+  ;;; A GEMM with a map epilogue runs as the GEMM of its prepared plan into
+  ;;; the output, followed by a seg-map kernel that applies the epilogue in
+  ;;; place over the product: its input 0 is the output itself, read at each
+  ;;; point before the point is written.  Should the kernel fail, the host
+  ;;; executor computes the GEMM and the epilogue again.
+
+  ;; The slot that stands for the GEMM's product in an epilogue kernel.
+  (define product-slot '%gemm-product)
+
+  ;; The epilogue body of a GEMM finalize fin of dtype dt: the product as
+  ;; stored, (cast dt (reduced)) or (reduced), is input 0, and the
+  ;; finalize's input j, j >= 2, is input j - 1.
+  (define (gemm-epilogue-body fin dt)
+    (let walk ((e fin))
+      (cond ((not (pair? e)) e)
+            ((equal? e '(reduced)) '(in 0))
+            ((and (eq? (car e) 'cast) (eq? (cadr e) dt) (equal? (caddr e) '(reduced))) '(in 0))
+            ((eq? (car e) 'in) `(in ,(- (cadr e) 1)))
+            (else (map walk e)))))
+
+  (define (epilogue-select sg host)
+    (let ((g (standard-gemm sg)))
+      (and g
+           (let ((epilogue (list-ref g 5)))
+             (and epilogue
+                  (eq? (car epilogue) 'map)
+                  (let* ((A-ref  (segop-operand-slot (list-ref g 0)))
+                         (B-ref  (segop-operand-slot (list-ref g 1)))
+                         (out    (list-ref g 2))
+                         (plan   (list-ref g 4))
+                         (dt     (segop-operand-dtype out))
+                         (shape  (segop-operand-shape out))
+                         (fin    (cases segop sg
+                                   (seg-red (space nred ins results map-outs fallback)
+                                     (red-result-finalize (car results)))
+                                   (else #f)))
+                         (prod   (make-segop-operand product-slot dt shape (segop-operand-strides out)
+                                                     (segop-operand-offset out) (identity-index-map 2))))
+                    (and fin
+                         (map-request shape (cons prod (cadr epilogue)) (list out)
+                                      (list (gemm-epilogue-body fin dt))
+                                      host 'segop/codegen-epilogue
+                                      (lambda (exec)
+                                        (lambda (deref buf)
+                                          (execute-gemm-plan/into! plan (deref A-ref) (deref B-ref) buf)
+                                          (exec deref buf)))))))))))
 
   (define max-red-rank 8)
 
@@ -916,6 +975,8 @@
     (let* ((rank (vector-length space))
            (outs (append (map red-result-out results) (map car map-outs)))
            (host (select-segop-executor sg 'crunch-codegen)))
+      (if (and host (eq? (car host) 'segop/gemm-epilogue-host))
+          (epilogue-select sg host)
       (and host
            ;; standard reductions and contractions keep their own executors
            (memq (car host) '(segop/strided-red segop/interpreted))
@@ -977,7 +1038,7 @@
                                                                 (cdr host)
                                                                 (max 1 (shape-size (subvector space npar rank)))))))
                                       (car batch)))
-                      (cons 'segop/codegen-red (segop-executor-cell-executor cell)))))))))
+                      (cons 'segop/codegen-red (segop-executor-cell-executor cell))))))))))
 
   (define (codegen-select sg)
     (and (crunch-codegen)
@@ -1002,14 +1063,41 @@
   (define (crunch-codegen-native? tpl)
     "The native-capability query of the backend: true, while crunch-codegen
     is true, when segop template tpl is a seg-map with affine maps over a
-    space of rank at most 6, or a seg-red (other than a GEMM) with affine
-    maps over a space of rank at most 8 whose results combine with add,
-    mul, max or min; its operands have the dtypes f32, f64, s32, s64 and
-    u32, and the typed translator accepts its bodies."
+    space of rank at most 6, a seg-red with affine maps over a space of
+    rank at most 8 whose results combine with add, mul, max or min, or a
+    GEMM with an epilogue (see gemm-template-native?); its operands have
+    the dtypes f32, f64, s32, s64 and u32, and the typed translator
+    accepts its bodies."
     (and (crunch-codegen)
-         (if (= (segop-template-nred tpl) 0)
-             (map-template-native? tpl)
-             (red-template-native? tpl))))
+         (cond ((= (segop-template-nred tpl) 0) (map-template-native? tpl))
+               ((gemm-template? tpl) (gemm-template-native? tpl))
+               (else (red-template-native? tpl)))))
+
+  (define (gemm-template? tpl)
+    (let ((outs (segop-template-outs tpl)))
+      (and (pair? outs) (eq? (template-output-combine (car outs)) 'gemm))))
+
+  ;; A GEMM template is native when it has an epilogue that the typed
+  ;; translator accepts, over the product (of the output's dtype, f32 or
+  ;; f64) and inputs read through affine maps of the product's indices.
+  ;; The GEMM itself runs on the BLAS backend.
+  (define (gemm-template-native? tpl)
+    (let* ((ins  (segop-template-ins tpl))
+           (outs (segop-template-outs tpl))
+           (res  (car outs))
+           (dt   (template-output-dtype res))
+           (fin  (template-output-finalize res))
+           (extras (if (and (pair? ins) (pair? (cdr ins))) (cddr ins) '())))
+      (and (null? (cdr outs))
+           (codegen-float-dtype? dt)
+           fin
+           (<= (+ 2 (length extras)) crunch-dispatch-n-max-vectors)
+           (every (lambda (i) (memq (template-input-dtype i) codegen-dtypes)) extras)
+           (every (lambda (i) (affine-map? (template-input-map i) 2)) extras)
+           (map-may-fail? (list (symbolic-body (gemm-epilogue-body fin dt)))
+                          (cons dt (map template-input-dtype extras))
+                          (list dt))
+           #t)))
 
   (define (red-template-native? tpl)
     (let* ((space (segop-template-space tpl))
