@@ -26,7 +26,9 @@
 ;;;
 ;;; The backend is used only while the parameter crunch-codegen is true;
 ;;; its default is true when the environment variable AM_CRUNCH_CODEGEN is
-;;; set to a value other than "" or "0".
+;;; set to a value other than "" or "0".  It reports to the fusion pass the
+;;; fused segops it can generate, so that the default fusion policy makes
+;;; them, for the fusion classes listed in crunch-codegen-fusions.
 ;;;
 ;;;   (import array-morphisms-crunch-codegen)
 ;;;   (register-crunch-codegen-backend!)
@@ -38,6 +40,7 @@
    crunch-codegen-cache-directory
    crunch-codegen-csc
    crunch-codegen-threads
+   crunch-codegen-fusions
    register-crunch-codegen-backend!
    unregister-crunch-codegen-backend!
    crunch-codegen-native?
@@ -96,6 +99,31 @@
   ;; The csc program that compiles generated modules.
   (define crunch-codegen-csc
     (make-parameter (make-pathname (foreign-value "C_INSTALL_BIN_HOME" c-string) "csc")))
+
+  ;; The fusion classes (see segop templates in array-morphisms) whose
+  ;; fused segops the backend reports as native, so that the default fusion
+  ;; policy makes them: a list of map, kept, horizontal, redomap, epilogue
+  ;; and gemm-epilogue.  The segops of the other classes are not fused
+  ;; under the default policy; under the policy all they are fused and
+  ;; still run as generated kernels.
+  (define all-fusion-classes '(map kept horizontal redomap epilogue gemm-epilogue))
+
+  ;; The default: the classes named in the environment variable
+  ;; AM_CRUNCH_CODEGEN_FUSIONS, separated by commas or spaces ("" for
+  ;; none), or all of them.
+  (define (default-fusion-classes)
+    (let ((v (get-environment-variable "AM_CRUNCH_CODEGEN_FUSIONS")))
+      (if v
+          (filter (lambda (c) (memq c all-fusion-classes))
+                  (map string->symbol (string-split v ", ")))
+          all-fusion-classes)))
+
+  (define crunch-codegen-fusions
+    (make-parameter (default-fusion-classes)
+                    (lambda (x)
+                      (unless (and (list? x) (every (lambda (c) (memq c all-fusion-classes)) x))
+                        (error 'crunch-codegen-fusions "not a list of fusion classes" x))
+                      x)))
 
   ;; The number of threads a kernel runs on, or #f to follow the active
   ;; activation backend: (crunch-thread-count) threads with the threaded
@@ -1067,8 +1095,11 @@
     rank at most 8 whose results combine with add, mul, max or min, or a
     GEMM with an epilogue (see gemm-template-native?); its operands have
     the dtypes f32, f64, s32, s64 and u32, and the typed translator
-    accepts its bodies."
+    accepts its bodies.  A template made for a fusion is native only when
+    its class is in (crunch-codegen-fusions)."
     (and (crunch-codegen)
+         (let ((class (segop-template-class tpl)))
+           (or (not class) (memq class (crunch-codegen-fusions))))
          (cond ((= (segop-template-nred tpl) 0) (map-template-native? tpl))
                ((gemm-template? tpl) (gemm-template-native? tpl))
                (else (red-template-native? tpl)))))

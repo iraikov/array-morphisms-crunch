@@ -22,7 +22,8 @@
 ;;;   Group 6b - seg-reds, against the interpreter and the host executor
 ;;;   Group 6c - GEMM epilogues, against fusion off
 ;;;   Group 7 - The cache and compile failures
-;;;   Group 8 - Native queries and SSA programs
+;;;   Group 8 - Native queries, SSA programs, training replays with
+;;;             parameter updates, and the fusion class switches
 
 (import scheme (chicken base) (chicken file) (only (scheme base) open-output-string)
         test
@@ -784,6 +785,100 @@
          (every (lambda (x y) (every same-element? x y))
                 (append (car off) (cadr off)) (append (car all) (cadr all))))))
    '(f32 f64)))
+
+;; A network normalizing the rows of its hidden layer: mean and sum
+;; reductions over rows, the maps around them, and a horizontal pair.
+(define (ssa-rownorm dtype)
+  (let* ((v (lambda (n f) (map f (iota n))))
+         (x (am:make-var (morph-from-list (v 32 (lambda (i) (- (* 0.17 i) 2.0))) #(4 8) dtype) #f))
+         (W (am:make-var (morph-from-list (v 48 (lambda (i) (* 0.25 (cos (+ i 0.3))))) #(8 6) dtype) #t))
+         (h (am:var-matmul x W))
+         (mu (am:var-mean h '(1) #t))
+         (d (am:var- h mu))
+         (e (am:var-exp d))
+         (s (am:var-sum e '(1) #t))
+         (p (am:var/ e s)))
+    (values (am:var+ (am:var-sum (am:var* p d)) (am:var-mean (am:var* d d))) (list W))))
+
+;; The losses and gradients of steps of plain gradient descent on the
+;; network made by make-net, the parameters updated in place between the
+;; replays of the joint program, under fusion policy policy with the code
+;; generator on or off; and the segop tags of the plan.
+(define (ssa-train make-net dtype policy codegen? steps)
+  (let-values (((loss params) (make-net dtype)))
+    (parameterize ((segop-fusion policy) (crunch-codegen codegen?)
+                   (segop-backends (parameterize ((segop-backends (segop-backends)))
+                                     (register-crunch-codegen-backend!)
+                                     (segop-backends))))
+      (let* ((fwd   (morphism-to-ssa loss))
+             (pv    (map (lambda (p) (ssa-constant-id fwd (am:var-value p))) params))
+             (joint (ssa-vjp fwd pv (ssa-loss-binding-val fwd)))
+             (ctx   (make-morphism-context))
+             (elems (lambda (r)
+                      (cases array-morphism r
+                        (concrete-array (d shape strides offset dt _ _)
+                          (map (lambda (i) (typed-vector-ref d dt (+ offset i))) (iota (shape-size shape))))
+                        (else #f))))
+             (update! (lambda (p g)
+                        (cases array-morphism (am:var-value p)
+                          (concrete-array (d shape strides offset dt _ _)
+                            (for-each (lambda (i gi)
+                                        (typed-vector-set! d dt i (- (typed-vector-ref d dt i) (* 0.05 gi))))
+                                      (iota (length g)) g))
+                          (else #f)))))
+        (ssa-realize/ctx ctx joint)
+        (finalize-context! ctx)
+        (let loop ((k 0) (acc '()))
+          (if (= k steps)
+              (list (reverse acc) (map car (cdr (assq 'counts (replay-plan-stats joint)))))
+              (begin
+                (reset-context! ctx)
+                (let ((rs (map elems (ssa-realize/ctx ctx joint))))
+                  (for-each update! params (cdr rs))
+                  (loop (+ k 1) (cons rs acc))))))))))
+
+(test-group "training replays"
+  (for-each
+   (lambda (net name)
+     (for-each
+      (lambda (dt)
+        (let ((off (ssa-train net dt #f #f 5)))
+          (for-each
+           (lambda (policy)
+             (let ((cg (ssa-train net dt policy #t 5)))
+               (test-assert (sprintf "~a ~a, policy ~a: generated kernels run" name dt policy)
+                 (any (lambda (t) (memq t '(segop/codegen-map segop/codegen-red segop/codegen-epilogue)))
+                      (cadr cg)))
+               (test-assert (sprintf "~a ~a, policy ~a: five steps equal those with fusion off" name dt policy)
+                 (every (lambda (step-off step-cg)
+                          (every (lambda (x y) (every same-element? x y)) step-off step-cg))
+                        (car off) (car cg)))))
+           '(#t all))))
+      '(f32 f64)))
+   (list ssa-net ssa-rownorm)
+   '("dense" "row normalization"))
+  (let-values (((loss params) (ssa-rownorm 'f32)))
+    (parameterize ((segop-fusion #t) (crunch-codegen #t) (crunch-codegen-fusions '(map))
+                   (segop-backends (parameterize ((segop-backends (segop-backends)))
+                                     (register-crunch-codegen-backend!)
+                                     (segop-backends))))
+      (let* ((fwd (morphism-to-ssa loss))
+             (pv  (map (lambda (p) (ssa-constant-id fwd (am:var-value p))) params)))
+        (ssa-vjp fwd pv (ssa-loss-binding-val fwd))
+        (test "with only the map class switched on, the default policy makes no other class" '()
+          (filter (lambda (c) (not (memq (car c) '(map))))
+                  (cdr (assq 'classes (ssa-fusion-pass-stats)))))))))
+
+(test-group "fusion class switches"
+  (let* ((tin (make-template-input 'f32 (identity-index-map 2) #t))
+         (tpl (lambda (class) (make-segop-template #(4 5) (list tin)
+                                                   (list (make-template-output 'f32 '(exp (in 0))))
+                                                   0 class))))
+    (parameterize ((crunch-codegen #t) (crunch-codegen-fusions '(map redomap)))
+      (test-assert "a class that is switched on is native" (crunch-codegen-native? (tpl 'map)))
+      (test "a class that is switched off is not native" #f (crunch-codegen-native? (tpl 'horizontal)))
+      (test-assert "a template made for no fusion is native" (crunch-codegen-native? (tpl #f))))
+    (test-error "an unknown class is an error" (crunch-codegen-fusions '(map sideways)))))
 
 (for-each (lambda (d) (delete-directory d #t)) temp-dirs)
 
