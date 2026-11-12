@@ -41,6 +41,7 @@
   (;; Normalized kernels (see array-morphisms-blas-exec)
    crunch-dgemm          crunch-sgemm
    crunch-dgemm-strided  crunch-sgemm-strided
+   crunch-dgemm-offset   crunch-sgemm-offset
    crunch-dgemv          crunch-sgemv
    crunch-ddot           crunch-sdot
    crunch-daxpy          crunch-saxpy
@@ -257,6 +258,60 @@
           (do ((c 0 (+ c 1))) ((= c cols))
             (f64vector-set! dst (+ d c) (f64vector-ref src (+ s (* c cs)))))))))
 
+  ;; %k-pack-off-<t> is %k-pack-<t> for an operand whose first element is
+  ;; at index off of src.
+  (crunch
+    (: (%k-pack-off-f32 integer integer f32vector integer integer integer f32vector) void)
+    (define (%k-pack-off-f32 rows cols src off rs cs dst)
+      (do ((r 0 (+ r 1))) ((= r rows))
+        (let ((s (+ off (* r rs)))
+              (d (* r cols)))
+          (do ((c 0 (+ c 1))) ((= c cols))
+            (f32vector-set! dst (+ d c) (f32vector-ref src (+ s (* c cs)))))))))
+
+  (crunch
+    (: (%k-pack-off-f64 integer integer f64vector integer integer integer f64vector) void)
+    (define (%k-pack-off-f64 rows cols src off rs cs dst)
+      (do ((r 0 (+ r 1))) ((= r rows))
+        (let ((s (+ off (* r rs)))
+              (d (* r cols)))
+          (do ((c 0 (+ c 1))) ((= c cols))
+            (f64vector-set! dst (+ d c) (f64vector-ref src (+ s (* c cs)))))))))
+
+  ;; am_crunch_gemm_nn_off_<t> runs am_crunch_gemm_nn_<t> on A, B and C
+  ;; seen from the element offsets scal[2], scal[3] and scal[4]: the kernel
+  ;; receives vector blocks whose data starts at those elements, so it
+  ;; computes exactly what it computes for matrices stored on their own.
+  (foreign-declare #<<EOC
+#include "crunch.h"
+void am_crunch_gemm_nn_f32(crunch_integer, crunch_integer, crunch_integer, crunch_integer,
+                           crunch_integer, crunch_f64vector, crunch_f32vector,
+                           crunch_f32vector, crunch_f32vector, crunch_f32vector);
+void am_crunch_gemm_nn_f64(crunch_integer, crunch_integer, crunch_integer, crunch_integer,
+                           crunch_integer, crunch_f64vector, crunch_f64vector,
+                           crunch_f64vector, crunch_f64vector, crunch_f64vector);
+#define AM_SHIFT_BLOCK(b, off, et)                                           \
+  do { (b).data += (off); (b).len -= (off);                                  \
+       (b).size -= (off) * (crunch_word)sizeof(et); } while (0)
+#define AM_DEFINE_GEMM_NN_OFF(t, et)                                         \
+static void am_crunch_gemm_nn_off_ ## t(crunch_integer start, crunch_integer end, \
+                                        crunch_integer N, crunch_integer K,  \
+                                        crunch_integer N8, crunch_f64vector scal, \
+                                        crunch_ ## t ## vector A,            \
+                                        crunch_ ## t ## vector B,            \
+                                        crunch_ ## t ## vector C,            \
+                                        crunch_ ## t ## vector unused) {     \
+  crunch_ ## t ## vector_block a = *A, b = *B, c = *C;                       \
+  AM_SHIFT_BLOCK(a, (crunch_word)scal->data[2], et);                         \
+  AM_SHIFT_BLOCK(b, (crunch_word)scal->data[3], et);                         \
+  AM_SHIFT_BLOCK(c, (crunch_word)scal->data[4], et);                         \
+  am_crunch_gemm_nn_ ## t(start, end, N, K, N8, scal, &a, &b, &c, unused);   \
+}
+AM_DEFINE_GEMM_NN_OFF(f32, float)
+AM_DEFINE_GEMM_NN_OFF(f64, double)
+EOC
+)
+
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Argument checking
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -295,6 +350,8 @@
 
   (define gemm-nn-f32 (foreign-value "((void *)&am_crunch_gemm_nn_f32)" c-pointer))
   (define gemm-nn-f64 (foreign-value "((void *)&am_crunch_gemm_nn_f64)" c-pointer))
+  (define gemm-nn-off-f32 (foreign-value "((void *)&am_crunch_gemm_nn_off_f32)" c-pointer))
+  (define gemm-nn-off-f64 (foreign-value "((void *)&am_crunch_gemm_nn_off_f64)" c-pointer))
 
   ;; Smallest number of multiply-adds worth giving to one thread.
   (define gemm-min-work-per-thread 65536)
@@ -387,6 +444,51 @@
     (gemm-strided 'crunch-dgemm-strided gemm-nn-f64 %k-pack-f64 crunch-dispatch4-f64
                   f64vector-length take-pack-f64! give-pack-f64!
                   M N K alpha A lda transa B ldb transb beta C))
+
+  ;; Computes C := alpha op(A) op(B) + beta C for matrices that start at
+  ;; element offsets off-A, off-B and off-C of their vectors; C is
+  ;; row-major with leading dimension N.  Gives the results gemm-strided
+  ;; gives for the same matrices stored from element 0: operands that are
+  ;; not plain row-major are packed in the same way, and the same kernel
+  ;; runs on the others in place.
+  (define (gemm-offset who kernel pack dispatch vec-length take! give!
+                       M N K alpha A off-A lda transa B off-B ldb transb beta C off-C)
+    (check-dims! who M N K lda ldb off-A off-B off-C)
+    (let-values (((sai sak) (if (trans? transa) (values 1 lda) (values lda 1)))
+                 ((sbk sbj) (if (trans? transb) (values 1 ldb) (values ldb 1))))
+      (check-length! who A vec-length (+ off-A (extent M K sai sak)))
+      (check-length! who B vec-length (+ off-B (extent K N sbk sbj)))
+      (check-length! who C vec-length (+ off-C (* M N)))
+      (let* ((pack-A? (not (and (= sai K) (= sak 1))))
+             (pack-B? (not (and (= sbk N) (= sbj 1))))
+             (A* (if pack-A?
+                     (let ((packed (take! (* M K))))
+                       (pack M K A off-A sai sak packed)
+                       packed)
+                     A))
+             (B* (if pack-B?
+                     (let ((packed (take! (* K N))))
+                       (pack K N B off-B sbk sbj packed)
+                       packed)
+                     B))
+             (scal (f64vector (exact->inexact alpha) (exact->inexact beta)
+                              (exact->inexact (if pack-A? 0 off-A))
+                              (exact->inexact (if pack-B? 0 off-B))
+                              (exact->inexact off-C))))
+        (dispatch M N K (* 8 (quotient N 8)) scal A* B* C C kernel
+                  (crunch-thread-count) (gemm-min-rows N K))
+        (when pack-A? (give! A*))
+        (when pack-B? (give! B*)))))
+
+  (define (crunch-sgemm-offset M N K alpha A off-A lda transa B off-B ldb transb beta C off-C)
+    (gemm-offset 'crunch-sgemm-offset gemm-nn-off-f32 %k-pack-off-f32 crunch-dispatch4-f32
+                 f32vector-length take-pack-f32! give-pack-f32!
+                 M N K alpha A off-A lda transa B off-B ldb transb beta C off-C))
+
+  (define (crunch-dgemm-offset M N K alpha A off-A lda transa B off-B ldb transb beta C off-C)
+    (gemm-offset 'crunch-dgemm-offset gemm-nn-off-f64 %k-pack-off-f64 crunch-dispatch4-f64
+                 f64vector-length take-pack-f64! give-pack-f64!
+                 M N K alpha A off-A lda transa B off-B ldb transb beta C off-C))
 
   ;; Row-major, no transposes: lda = K, ldb = N.
   (define (crunch-sgemm M N K alpha A B beta C)
