@@ -42,6 +42,7 @@
    crunch-dgemm          crunch-sgemm
    crunch-dgemm-strided  crunch-sgemm-strided
    crunch-dgemm-offset   crunch-sgemm-offset
+   crunch-ddot-offset    crunch-sdot-offset
    crunch-dgemv          crunch-sgemv
    crunch-ddot           crunch-sdot
    crunch-daxpy          crunch-saxpy
@@ -116,6 +117,15 @@
       (let ((sum 0.0))
         (do ((i 0 (+ i 1))) ((= i N))
           (set! sum (+ sum (* (@ref x i) (@ref y i)))))
+        (f64vector-set! result 0 sum)))
+
+    ;; result[0] := sum_i x[offx + i] y[offy + i], in the order of %k-dot
+    (%k-dot-off (N x offx y offy result)
+                (integer @vec integer @vec integer f64vector)
+                void
+      (let ((sum 0.0))
+        (do ((i 0 (+ i 1))) ((= i N))
+          (set! sum (+ sum (* (@ref x (+ offx i)) (@ref y (+ offy i))))))
         (f64vector-set! result 0 sum)))
 
     ;; y[i] := alpha x[i] + y[i]
@@ -530,6 +540,20 @@ EOC
 
   (define (crunch-sdot N x y) (dot 'crunch-sdot %k-dot-f32 f32vector-length N x y))
   (define (crunch-ddot N x y) (dot 'crunch-ddot %k-dot-f64 f64vector-length N x y))
+
+  ;; DOT of vectors that start at element offsets off-x and off-y.
+  (define (dot-offset who kernel vec-length N x off-x y off-y)
+    (check-dims! who N off-x off-y)
+    (check-length! who x vec-length (+ off-x N))
+    (check-length! who y vec-length (+ off-y N))
+    (let ((result (make-f64vector 1 0.0)))
+      (kernel N x off-x y off-y result)
+      (f64vector-ref result 0)))
+
+  (define (crunch-sdot-offset N x off-x y off-y)
+    (dot-offset 'crunch-sdot-offset %k-dot-off-f32 f32vector-length N x off-x y off-y))
+  (define (crunch-ddot-offset N x off-x y off-y)
+    (dot-offset 'crunch-ddot-offset %k-dot-off-f64 f64vector-length N x off-x y off-y))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; AXPY

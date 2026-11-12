@@ -573,4 +573,35 @@
                           (sprintf "threads ~A:" threads))))
    '(1 4)))
 
+;; The offset DOT kernel on vectors stored from offsets equals, bit for
+;; bit, the DOT kernel on the same vectors stored from element 0.
+(define (offset-dot-agrees? backend dt N off-x off-y)
+  (let* ((f64?  (eq? dt 'f64))
+         (make  (if f64? make-f64vector make-f32vector))
+         (vset! (if f64? f64vector-set! f32vector-set!))
+         (dot   (if f64? (blas-backend-dot-f64 backend) (blas-backend-dot-f32 backend)))
+         (doto  (if f64? (blas-backend-dot-offset-f64 backend)
+                    (blas-backend-dot-offset-f32 backend)))
+         (fill  (lambda (v off seed)
+                  (do ((i 0 (+ i 1))) ((= i N) v)
+                    (vset! v (+ off i) (sin (+ seed (* 0.37 i))))))))
+    (eqv? (dot N (fill (make N) 0 0.1) (fill (make N) 0 0.7))
+          (doto N (fill (make (+ off-x N 2)) off-x 0.1) off-x
+                (fill (make (+ off-y N 2)) off-y 0.7) off-y))))
+
+(define (offset-dot-tests backend label)
+  (for-each
+   (lambda (dt)
+     (for-each
+      (lambda (N)
+        (test-assert (string-append label " " (symbol->string dt) " N=" (number->string N))
+          (and (offset-dot-agrees? backend dt N 0 0)
+               (offset-dot-agrees? backend dt N 3 0)
+               (offset-dot-agrees? backend dt N 1 17))))
+      '(1 7 64 1000 4099)))
+   '(f32 f64)))
+
+(test-group "crunch BLAS - offset DOT kernels"
+  (offset-dot-tests (make-crunch-blas-backend) "offset dot"))
+
 (test-exit)
