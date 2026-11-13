@@ -14,7 +14,7 @@ dispatch, boxing or allocation in their inner loops.
 |---|---|
 | `array-morphisms-crunch-activations` | f32/f64 kernels for `relu`, `sigmoid`, `tanh` and their SSA derivative ops, and for `exp`, `log`, `sqrt`, `negate`, `abs`; row softmax (`crunch-softmax-rows-f32`/`-f64`) and interleaved rotary embedding (`crunch-rope-f32`/`-f64`); binary kernels for `add`, `sub`, `mul`, `div`; axis-0 and axis-1 reductions (`sum`, `mean`, `max`, `min`); a strided copy; `make-crunch-activation-backend` and `make-crunch-threaded-activation-backend` |
 | `array-morphisms-crunch-threads` | the POSIX-thread dispatchers for chunk kernels (`crunch-dispatch-f32`, `crunch-dispatch-f64`, `crunch-dispatch4-f32`, `crunch-dispatch4-f64`, and `crunch-dispatch-n` for generated kernels), their settings, and the persistent worker pool they share |
-| `array-morphisms-crunch-blas-backend` | `crunch-{s,d}gemm`, `-gemm-strided`, `-gemv`, `-dot`, `-axpy` with the normalized signatures of `array-morphisms-blas-exec`; `crunch-native-build?` |
+| `array-morphisms-crunch-blas-backend` | `crunch-{s,d}gemm`, `-gemm-strided`, `-gemm-offset`, `-gemv`, `-dot`, `-dot-offset`, `-axpy` with the normalized signatures of `array-morphisms-blas-exec`; `crunch-native-build?` |
 | `array-morphisms-crunch-conv-backend` | NCHW/NHWC `im2col`, `col2im`, `bias-add`, the six convolution hooks, and `make-crunch-blas-backend` (the complete `blas-backend` record) |
 | `array-morphisms-crunch-optimizers` | `crunch-adam-f32` and `crunch-adam-f64`, whole-vector Adam updates for nanograd's optimizer-kernel registry |
 | `array-morphisms-crunch-codegen` | a segop backend that generates, compiles and runs a kernel for each segop of a replay plan (see Code generation) |
@@ -433,6 +433,11 @@ sigmoid and about 4K for relu, so `crunch-thread-min-chunk` defaults to
   number of threads and, in a portable build, equals that of a naive loop.
 - As in reference BLAS, `C` is not read when `beta` is 0, and the values of
   `A` and `B` do not affect the result when `alpha` is 0.
+- `crunch-{s,d}gemm-offset` and `crunch-{s,d}dot-offset` take matrices and
+  vectors that start at an offset into their vectors, as array-morphisms
+  needs for the cells of a batched product and the rows of a framed sum.
+  They pack and compute exactly as the strided GEMM and the DOT kernel do,
+  so their results are the same bit for bit.
 - The convolution kernels follow the column layout of `kernels/im2col.c` in
   array-morphisms: `[N*OH*OW, C*KH*KW]`, with columns ordered `(c, kh, kw)`
   for both NCHW and NHWC images, and call the GEMM above.
