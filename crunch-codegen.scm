@@ -365,7 +365,7 @@
                                ,@(map (lambda (j) `(set! ,(o j) (+ ,(o j) (* %cnt ,(c j last))))) ops)
                                ,carry)))))))))))
 
-  ;;; A seg-red kernel visits the kept points [start, end), the points of
+  ;;; A seg-reduce kernel visits the kept points [start, end), the points of
   ;;; the first npar dimensions, in row-major order, one at a time or in
   ;;; tiles along the last kept dimension (see red-tile-size).  For each it sets the
   ;;; accumulators to the neutral elements, walks the reduced points in
@@ -380,7 +380,7 @@
   ;;; by one thread in the order of the reference interpreter, so the
   ;;; results are the same for every thread count.
 
-  ;; The parts of a seg-red kernel specification: its bodies field is
+  ;; The parts of a seg-reduce kernel specification: its bodies field is
   ;; (nred results map-bodies), each result a list
   ;; (op acc-dtype order body finalize) with finalize #f for none.
   (define (red-nred spec) (car (kspec-bodies spec)))
@@ -389,7 +389,7 @@
 
   ;; The statements of one reduced point and of one kept point, and
   ;; whether they can set the failure flag, from:
-  ;;   results, map-bodies: as in a seg-red kernel specification;
+  ;;   results, map-bodies: as in a seg-reduce kernel specification;
   ;;   in-dts, out-dts:     the dtypes of the inputs and of the outputs
   ;;                        (results, then map outputs);
   ;;   read, kept-read:     the forms reading input k at the reduced point
@@ -572,7 +572,7 @@
                                      (set! %step 1)))
                          single))))))))))
 
-  ;;; A seg-red kernel computes red-tile-size consecutive kept points
+  ;;; A seg-reduce kernel computes red-tile-size consecutive kept points
   ;;; together when they lie along the last kept dimension: it walks the
   ;;; reduced points once, and at each one computes every kept point of
   ;;; the tile, each with its own accumulators.  Each accumulator combines
@@ -1026,7 +1026,7 @@
                          (dt     (segop-operand-dtype out))
                          (shape  (segop-operand-shape out))
                          (fin    (cases segop sg
-                                   (seg-red (space nred ins results map-outs fallback)
+                                   (seg-reduce (space nred ins results map-outs fallback)
                                      (red-result-finalize (car results)))
                                    (else #f)))
                          (prod   (make-segop-operand product-slot dt shape (segop-operand-strides out)
@@ -1043,7 +1043,7 @@
   (define max-red-rank 8)
 
   ;; The combine specs a generated kernel follows: the unspecified order is
-  ;; taken as sequential, as the host executors of non-standard seg-reds
+  ;; taken as sequential, as the host executors of non-standard seg-reduces
   ;; take it.
   (define (red-spec-ok? spec)
     (and (spec-op spec)
@@ -1064,7 +1064,7 @@
   (define (spec-order spec)
     (if (eq? (combine-spec-order spec) 'blocked) 'blocked 'sequential))
 
-  ;; The canonical form of a seg-red's bodies: the list (results
+  ;; The canonical form of a seg-reduce's bodies: the list (results
   ;; map-bodies) of a kernel specification, and the input order, as two
   ;; values.
   (define (canonical-red results map-bodies)
@@ -1077,7 +1077,7 @@
                     (cdaddr canon))
               order)))
 
-  ;; yes, no or #f, as map-may-fail? does, for a seg-red kernel.
+  ;; yes, no or #f, as map-may-fail? does, for a seg-reduce kernel.
   (define (red-may-fail? results map-bodies in-dts out-dts)
     (let* ((z  (lambda (j) 0))
            (st (red-statements results map-bodies in-dts out-dts z z z z
@@ -1159,7 +1159,7 @@
          (segop-plan-context)
          (cases segop sg
            (seg-map (space ins outs bodies fallback) (map-select sg space ins outs bodies))
-           (seg-red (space nred ins results map-outs fallback)
+           (seg-reduce (space nred ins results map-outs fallback)
              (and (> nred 0) (red-select sg space nred ins results map-outs)))
            (else #f))))
 
@@ -1177,7 +1177,7 @@
   (define (crunch-codegen-native? tpl)
     "The native-capability query of the backend: true, while crunch-codegen
     is true, when segop template tpl is a seg-map with affine maps over a
-    space of rank at most 6, a seg-red with affine maps over a space of
+    space of rank at most 6, a seg-reduce with affine maps over a space of
     rank at most 8 whose results combine with add, mul, max or min, or a
     GEMM with an epilogue (see gemm-template-native?); its operands have
     the dtypes f32, f64, s32, s64 and u32, and the typed translator

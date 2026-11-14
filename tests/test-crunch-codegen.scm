@@ -19,7 +19,7 @@
 ;;;   Group 4 - Several outputs
 ;;;   Group 5 - Mixed and integer dtypes, and the failure fallback
 ;;;   Group 6 - Thread counts
-;;;   Group 6b - seg-reds, against the interpreter and the host executor
+;;;   Group 6b - seg-reduces, against the interpreter and the host executor
 ;;;   Group 6c - GEMM epilogues, against fusion off
 ;;;   Group 7 - The cache and compile failures
 ;;;   Group 8 - Native queries, SSA programs, training replays with
@@ -437,12 +437,12 @@
          '(1 2 7))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Group 6b - seg-reds
+;;; Group 6b - seg-reduces
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (define (exprs-map . es) (make-index-map (list->vector es) #f 0.0 #f))
 
-;; A seg-red case over space, whose last nred dimensions are reduced.
+;; A seg-reduce case over space, whose last nred dimensions are reduced.
 ;; env is a list of (slot array . index-map); results a list of
 ;; (dtype shape map body combine finalize), each written to a row-major
 ;; output of that shape through map; map-outs a list of (dtype body),
@@ -458,7 +458,7 @@
          (mos (map (lambda (mo k)
                      (cons (out-operand (string->symbol (sprintf "mo~a" k)) (car mo) space) (cadr mo)))
                    map-outs (iota (length map-outs)))))
-    (make-tcase (make-seg-red space nred ins res mos)
+    (make-tcase (make-seg-reduce space nred ins res mos)
                 (map (lambda (e) (cons (car e) (cadr e))) env)
                 (append (map (lambda (r) (shape-size (cadr r))) results)
                         (map (lambda (mo) (shape-size space)) map-outs)))))
@@ -563,7 +563,7 @@
                            (make-combine-spec (list 'opaque max) (- (expt 2 31)) 's32) #f))
                '()))))
 
-(test-group "seg-reds"
+(test-group "seg-reduces"
   (let-values (((results notes) (check-red-cases (red-cases))))
     (for-each (lambda (name r) (test name '(segop/codegen-red #t #t) (values r)))
               '("axis-0 sum with a stored product" "axis-1 sum with a mean"
@@ -620,7 +620,7 @@
   (let ((c (red-case #(5 7) 1 (list (cons* 'a (flat-array 'f64 #(7 5) value-at) (exprs-map '(dim 1) '(dim 0))))
                      (list (list 'f64 #(5) (exprs-map '(dim 0)) '(in 0) (make-combine-spec 'add 0.0 'f64) #f))
                      '())))
-    (test-assert "a seg-red the host runs with another executor is left to it"
+    (test-assert "a seg-reduce the host runs with another executor is left to it"
       (let ((ctx (make-segop-plan-context)))
         (parameterize ((segop-plan-context ctx) (segop-backends (cg-backends)) (crunch-codegen #t))
           (let ((sel (select-segop-executor (tcase-sg c))))
