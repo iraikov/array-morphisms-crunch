@@ -12,7 +12,7 @@ dispatch, boxing or allocation in their inner loops.
 
 | Module | Contents |
 |---|---|
-| `array-morphisms-crunch-activations` | f32/f64 kernels for `relu`, `sigmoid`, `tanh` and their SSA derivative ops, and for `exp`, `log`, `sqrt`, `negate`, `abs`; row softmax (`crunch-softmax-rows-f32`/`-f64`) and interleaved rotary embedding (`crunch-rope-f32`/`-f64`); binary kernels for `add`, `sub`, `mul`, `div`; axis-0 and axis-1 reductions (`sum`, `mean`, `max`, `min`); a strided copy; `make-crunch-activation-backend` and `make-crunch-threaded-activation-backend` |
+| `array-morphisms-crunch-activations` | f32/f64 kernels for `relu`, `sigmoid`, `tanh` and their SSA derivative ops, and for `exp`, `log`, `sqrt`, `negate`, `abs`; row softmax (`crunch-softmax-rows-f32`/`-f64`) and interleaved rotary embedding (`crunch-rope-f32`/`-f64`); binary kernels for `add`, `sub`, `mul`, `div`; axis-0 and axis-1 reductions (`sum`, `mean`, `max`, `min`); scans (`sum`, `prod`, `max`, `min`) of row-major arrays along any axis; a strided copy; `make-crunch-activation-backend` and `make-crunch-threaded-activation-backend` |
 | `array-morphisms-crunch-threads` | the POSIX-thread dispatchers for chunk kernels (`crunch-dispatch-f32`, `crunch-dispatch-f64`, `crunch-dispatch4-f32`, `crunch-dispatch4-f64`, and `crunch-dispatch-n` for generated kernels), their settings, and the persistent worker pool they share |
 | `array-morphisms-crunch-blas-backend` | `crunch-{s,d}gemm`, `-gemm-strided`, `-gemm-offset`, `-gemv`, `-dot`, `-dot-offset`, `-axpy` with the normalized signatures of `array-morphisms-blas-exec`; `crunch-native-build?` |
 | `array-morphisms-crunch-conv-backend` | NCHW/NHWC `im2col`, `col2im`, `bias-add`, the six convolution hooks, and `make-crunch-blas-backend` (the complete `blas-backend` record) |
@@ -108,6 +108,13 @@ the same way:
   row-major 2-D array reduced over axis 0 or 1. Each kernel rounds exactly
   as the Scheme fast path it replaces: over axis 0 an f32 sum is rounded
   after every addition, over axis 1 it is kept in double precision.
+- **Scans.** A scan of a row-major f32 or f64 array with `sum`, `prod`,
+  `max` or `min`, along any axis, runs on a scan kernel during replay
+  (`segop/scan-kernel`). Every step is stored before the next one reads
+  it, so f32 scans round at every step, as the Scheme loop does. A scan
+  along the last axis runs 8 lines together, one position of each at a
+  time; a scan along another axis works through whole rows. Both
+  backends use the same single-threaded scan kernels.
 - **Strided copies.** Copies of transposed or offset views of rank at most 4
   into row-major order, such as the copies of transposed gradient outputs,
   use the copy kernel.
@@ -242,7 +249,11 @@ What it runs:
   final step it put after them;
 - matrix products with an epilogue: the product is computed by the BLAS
   backend, and the epilogue runs as a generated kernel over the stored
-  product.
+  product;
+- scans over spaces of up to rank 8 that the catalogue scan kernels do not
+  run: scans with a combining expression, scans of strided arrays, and
+  integer scans. The combining expression must use table ops and `cast`
+  only (an expression with `if` runs on the host).
 
 The operands may be f32, f64, s32, s64 or u32, mixed as the body needs.
 A kernel is fixed in the rank of its space, its bodies and its dtypes;
@@ -255,7 +266,9 @@ body says so, adds in the same order, and follows Scheme's arithmetic
 on mixed integers and floats. A reduction keeps each output point's
 additions in order; it computes up to 8 neighbouring output points
 together, each with its own accumulator, so that sums over the rows of
-a matrix read memory in order. When an integer result would leave the
+a matrix read memory in order. A scan likewise runs up to 8 neighbouring
+lines together, each reading back the value it stored at the position
+before. When an integer result would leave the
 range of its dtype, the kernel stops and the segop runs on the host for
 that call. Kernels are split across threads like the threaded
 activation kernels, and their results do not depend on the number of
@@ -293,8 +306,8 @@ policy `'all`, every legal fusion is made, and the code generator runs
 the fused segops of every class.
 
 **Reports.** The timing profile and `replay-plan-stats` name the
-generated kernels `segop/codegen-map`, `segop/codegen-red` and
-`segop/codegen-epilogue`. `replay-plan-stats` also reports, under
+generated kernels `segop/codegen-map`, `segop/codegen-red`,
+`segop/codegen-epilogue` and `segop/codegen-scan`. `replay-plan-stats` also reports, under
 `crunch-codegen`, how many of the plan's segops became kernels, and how
 many of those were compiled, loaded from the cache, or could not be
 compiled. `crunch-codegen-stats` gives the same totals for the whole
