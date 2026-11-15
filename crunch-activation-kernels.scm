@@ -742,7 +742,11 @@
   ;;     before combined with x of the position before.
   ;; Every value is stored before it is used again, so f32 scans round at
   ;; every step; max and min replace the value so far only when the
-  ;; comparison holds, so a NaN element is passed over.
+  ;; comparison holds, so a NaN element is passed over.  When inner is 1
+  ;; (a scan along the last axis) each line is contiguous; the kernel then
+  ;; scans eight lines together, one position of each at a time, so that
+  ;; the steps of different lines, which do not wait for each other,
+  ;; overlap.
   ;;
   ;; (define-crunch-scans (op neutral (a x) step) ...) defines the kernels
   ;; of each op, step being the expression of a and x, and binds
@@ -764,13 +768,50 @@
                         (if (eq? order 'acc)
                             `(let ((,a ,acc-form) (,x ,x-form)) ,step)
                             `(let ((,a ,x-form) (,x ,acc-form)) ,step))))
-                (row (lambda (value) `(do ((i 0 (+ i 1))) ((= i inner)) (,set out (+ b i) ,value)))))
+                (row (lambda (value) `(do ((i 0 (+ i 1))) ((= i inner)) (,set out (+ b i) ,value))))
+                ;; the lines o + t for t in ts, contiguous, scanned together
+                ;; from index f_t in direction dir
+                (lines
+                 (lambda (ts)
+                   (let* ((fv (lambda (t) (string->symbol (string-append "f" (number->string t)))))
+                          (iv (lambda (t) (string->symbol (string-append "i" (number->string t)))))
+                          (each (lambda (form-of) (map form-of ts))))
+                     `(let* ((dir (if (= rev 1) -1 1))
+                             ,@(each (lambda (t) `(,(fv t) (let ((base (* (+ o ,t) n)))
+                                                              (if (= rev 1) (+ base (- n 1)) base))))))
+                        (if (= excl 0)
+                            (begin
+                              (if (= hs 1)
+                                  (begin ,@(each (lambda (t) `(,set out ,(fv t) ,(comb `(,ref seed (+ o ,t)) `(,ref src ,(fv t)))))))
+                                  (begin ,@(each (lambda (t) `(,set out ,(fv t) (,ref src ,(fv t)))))))
+                              (do ((r 1 (+ r 1))) ((>= r n))
+                                (let* ,(each (lambda (t) `(,(iv t) (+ ,(fv t) (* r dir)))))
+                                  ,@(each (lambda (t) `(,set out ,(iv t) ,(comb `(,ref out (- ,(iv t) dir)) `(,ref src ,(iv t)))))))))
+                            (begin
+                              (if (= hs 1)
+                                  (begin ,@(each (lambda (t) `(,set out ,(fv t) (,ref seed (+ o ,t))))))
+                                  (begin ,@(each (lambda (t) `(,set out ,(fv t) ,neutral)))))
+                              (if (> n 1)
+                                  (begin
+                                    (if (= hs 1)
+                                        (begin ,@(each (lambda (t) `(,set out (+ ,(fv t) dir) ,(comb `(,ref seed (+ o ,t)) `(,ref src ,(fv t)))))))
+                                        (begin ,@(each (lambda (t) `(,set out (+ ,(fv t) dir) (,ref src ,(fv t)))))))
+                                    (do ((r 2 (+ r 1))) ((>= r n))
+                                      (let* ,(each (lambda (t) `(,(iv t) (+ ,(fv t) (* r dir)))))
+                                        ,@(each (lambda (t) `(,set out ,(iv t) ,(comb `(,ref out (- ,(iv t) dir)) `(,ref src (- ,(iv t) dir)))))))))))))))))
            `(,(r 'crunch)
              (: (,k integer integer integer ,vec ,vec ,vec integer) void)
              (define (,k outer n inner src seed out flags)
                (let ((excl (remainder flags 2))
                      (rev  (remainder (quotient flags 2) 2))
                      (hs   (remainder (quotient flags 4) 2)))
+                 (if (= inner 1)
+                     (if (> n 0)
+                         (let ((full (* 8 (quotient outer 8))))
+                           (do ((o 0 (+ o 8))) ((>= o full))
+                             ,(lines '(0 1 2 3 4 5 6 7)))
+                           (do ((o full (+ o 1))) ((>= o outer))
+                             ,(lines '(0)))))
                  (do ((o 0 (+ o 1))) ((= o outer))
                    (do ((r 0 (+ r 1))) ((= r n))
                      (let* ((pos (if (= rev 1) (- (- n 1) r) r))
@@ -792,7 +833,7 @@
                                    (if (= hs 1)
                                        ,(row (comb `(,ref seed (+ sb i)) `(,ref src (+ pb i))))
                                        ,(row `(,ref src (+ pb i))))
-                                   ,(row (comb `(,ref out (+ pb i)) `(,ref src (+ pb i)))))))))))))))
+                                   ,(row (comb `(,ref out (+ pb i)) `(,ref src (+ pb i))))))))))))))))
        (let ((entries (cdr form)))
          `(,(r 'begin)
            ,@(apply append
