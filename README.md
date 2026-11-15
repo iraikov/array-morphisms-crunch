@@ -252,10 +252,17 @@ What it runs:
   product;
 - scans over spaces of up to rank 8 that the catalogue scan kernels do not
   run: scans with a combining expression, scans of strided arrays, and
-  integer scans. The combining expression must use table ops and `cast`
-  only (an expression with `if` runs on the host).
+  integer scans. The combining expression may use table ops, `cast` and
+  `if` (see below).
 
 The operands may be f32, f64, s32, s64 or u32, mixed as the body needs.
+A body may contain `(if (rel x y) a b)`, with `rel` one of `<`, `>`, `<=`,
+`>=` and `=`, when `a` and `b` are both integers or both floats; the test
+compares as Scheme does, so a NaN makes it false. The kernel computes
+both branches and then picks one. If the branch not taken overflows an
+integer, the kernel stops and the host computes that call; otherwise the
+results are the same as when only the chosen branch is computed. A body
+whose branches have different types runs on the host.
 A kernel is fixed in the rank of its space, its bodies and its dtypes;
 extents, offsets and strides are passed when it runs, so one kernel
 serves every batch size and layout.
