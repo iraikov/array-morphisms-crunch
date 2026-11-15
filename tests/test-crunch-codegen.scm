@@ -18,6 +18,7 @@
 ;;;   Group 3 - Broadcast, transposed and offset operands, ranks 0 to 4
 ;;;   Group 4 - Several outputs
 ;;;   Group 5 - Mixed and integer dtypes, and the failure fallback
+;;;   Group 5b - Conditional bodies
 ;;;   Group 6 - Thread counts
 ;;;   Group 6b - seg-reduces, against the interpreter and the host executor
 ;;;   Group 6c - GEMM epilogues, against fusion off
@@ -422,6 +423,55 @@
                     (car (select-segop-executor (tcase-sg c))))))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Group 5b - Conditional bodies
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(test-group "conditional bodies"
+  (let* ((env2 (lambda (dt) (list (cons 'a (flat-array dt #(7 9) value-at))
+                                  (cons 'b (flat-array dt #(7 9) value2-at)))))
+         (r (let-values (((r notes)
+                          (check-cases
+                           (list (map-case #(7 9) (env2 'f32) '((if (> (in 0) (in 1)) (in 0) (mul (in 1) 2.0))) '(f32))
+                                 (map-case #(7 9) (env2 'f64) '((if (<= (in 0) 0.0) (negate (in 0)) (exp (in 0)))) '(f64))
+                                 (map-case #(7 9) (env2 'f64) '((if (= (in 0) (in 1)) 1.5 -2.5)) '(f64))
+                                 (map-case #(7 9) (env2 'f32) '((if (>= (in 0) (in 1)) (in 1) (cast f32 (add (in 0) (in 1))))) '(f32))))))
+              r)))
+    (test-assert "f32 and f64 conditionals: generated, with the interpreter's bits"
+      (every (lambda (x) (and (eq? (car x) 'segop/codegen-map) (cdr x))) r)))
+
+  (let* ((ints (lambda (dt) (flat-array dt #(5 11) (lambda (i) (- (modulo (* 7 i) 23) 11)))))
+         (r (let-values (((r notes)
+                          (check-cases
+                           (list (map-case #(5 11) (list (cons 'a (ints 's32)) (cons 'b (flat-array 's32 #(5 11) (lambda (i) (- 5 (modulo i 9))))))
+                                           '((if (< (in 0) (in 1)) (in 0) (in 1))) '(s32) #t)
+                                 (map-case #(5 11) (list (cons 'a (ints 's32)) (cons 'b (flat-array 'f64 #(5 11) value-at)))
+                                           '((if (> (in 0) (in 1)) (in 1) (mul (in 1) 0.5))) '(f64) #t)))))
+              r)))
+    (test-assert "integer and mixed comparisons: generated, with the interpreter's bits"
+      (every (lambda (x) (and (eq? (car x) 'segop/codegen-map) (cdr x))) r)))
+
+  ;; Branches of different types are not translated.
+  (let ((r (let-values (((r notes)
+                         (check-cases
+                          (list (map-case #(3 4) (list (cons 'a (flat-array 's32 #(3 4) (lambda (i) (- i 5)))))
+                                          '((if (> (in 0) 0) (in 0) 2.5)) '(f64) #t)))))
+             r)))
+    (test-assert "branches of different types run on the host, with the interpreter's bits"
+      (and (not (eq? (car (car r)) 'segop/codegen-map)) (cdr (car r)))))
+
+  ;; Every point takes the first branch, but the kernel also computes the
+  ;; second, which overflows s64: the kernel reports failure and the host
+  ;; computes the call.
+  (let ((r (let-values (((r notes)
+                         (check-cases
+                          (list (map-case #(2 6) (list (cons 'a (flat-array 's64 #(2 6)
+                                                                            (lambda (i) (+ (expt 2 40) i)))))
+                                          '((if (> (in 0) 0) (in 0) (mul (in 0) (mul (in 0) (in 0))))) '(s64) #t)))))
+             r)))
+    (test-assert "an overflowing branch gives the interpreter's values"
+      (and (eq? (car (car r)) 'segop/codegen-map) (cdr (car r))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Group 6 - Thread counts
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -700,9 +750,11 @@
                                  body: '(mul (in 0) (in 0)))))))
     (test-assert "combine expressions: generated, and the interpreter's bits"
       (every (lambda (x) (and (eq? (car x) 'segop/codegen-scan) (cdr x))) r)))
-  (let ((r (scan-results (list (row-scan-case 'f64 2 5 (make-combine-spec '(lambda (a b) (if (> b a) b a)) #f 'f64))))))
-    (test "an expression with if stays on the host" 'segop/strided-scan (car (car r)))
-    (test-assert "and gives the interpreter's bits" (cdr (car r))))
+  (let ((r (scan-results (list (row-scan-case 'f64 2 5 (make-combine-spec '(lambda (a b) (if (> b a) b a)) #f 'f64))
+                               (row-scan-case 'f32 7 13 (make-combine-spec '(lambda (a b) (if (< b 0.0) (* a 0.5) (+ a b))) #f 'f32)
+                                              rev: #t seed?: #t)))))
+    (test-assert "expressions with if are generated, with the interpreter's bits"
+      (every (lambda (x) (and (eq? (car x) 'segop/codegen-scan) (cdr x))) r)))
 
   ;; Tiles of consecutive lines: full tiles and the lines after them, a
   ;; parallel space of rank 2 whose last extent is not a multiple of the

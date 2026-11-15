@@ -170,6 +170,11 @@
     of its value, a variable or a literal; may-fail? is true when a helper
     that can set the failure flag is used.
 
+    A conditional (if (rel x y) a b), rel one of < > <= >= =, is
+    translated when a and b have the same type (both integer or both
+    float); the test compares x and y exactly as Scheme does.  Both
+    branches are computed before the choice.
+
     input:   a procedure giving, for input k, a pair (form . type) that
              reads it at the current point
     helper:  a procedure giving the crunch name of the helper of a given
@@ -207,7 +212,14 @@
          (define (tr-node e)
            (case (car e)
              ((cast) (tr-cast (cadr e) (tr (caddr e))))
-             ((in reduced param idx opaque if let*) (fail))
+             ((if)
+              (unless (= (length e) 4) (fail))
+              (let* ((c (tr-test (cadr e)))
+                     (a (tr (caddr e)))
+                     (b (tr (cadddr e))))
+                (unless (eq? (cdr a) (cdr b)) (fail))
+                (bind! `(if ,c ,(car a) ,(car b)) (cdr a))))
+             ((in reduced param idx opaque let*) (fail))
              ((%gadd)
               (unless (= (length e) 3) (fail))
               (let ((a (tr (cadr e))) (b (tr (caddr e))))
@@ -223,6 +235,11 @@
                      (entry (assq op scalar-ops-table)))
                 (unless (and entry (= (length (cadr entry)) (length (cdr e)))) (fail))
                 (tr-op entry (map tr (cdr e)))))))
+         ;; The crunch test of comparison e, (rel x y).
+         (define (tr-test e)
+           (unless (and (pair? e) (list? e) (= (length e) 3) (memq (car e) '(< > <= >= =)))
+             (fail))
+           (typed-comparison (car e) (tr (cadr e)) (tr (caddr e)) h))
          (define (tr-cast dt a)
            (case dt
              ((f64) (if (eq? (cdr a) 'f) a (bind! (to-float a) 'f)))
