@@ -12,6 +12,7 @@
 ;;;   Group 2 - Kernel values against the Scheme combiners (f32 and f64)
 ;;;   Group 3 - Sizes, prefixes, in-place use and argument checking
 ;;;   Group 4 - SSA replay with and without the crunch backend
+;;;   Scan kernels (at the end)
 
 (import scheme (chicken base)
         test
@@ -645,4 +646,92 @@
       (copy (make-f32vector 10) 0 (vector 4 4) (vector 4 1) (make-f32vector 16)))))
 
 (register-activation-backend! #f)
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Scan kernels
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; The scan of the outer x n x inner array src along its middle axis by
+;; execute-scan-morphism, the reference, and by the kernel of be.
+(define (scan-reference op dt outer n inner src seed flags)
+  (let* ((shape (vector outer n inner))
+         (bit (lambda (b) (odd? (quotient flags b))))
+         (out (if (eq? dt 'f32) (make-f32vector (* outer n inner)) (make-f64vector (* outer n inner))))
+         (x (concrete-array src shape (compute-strides shape) 0 dt -1 -1))
+         (s (concrete-array seed (vector outer inner) (vector inner 1) 0 dt -1 -1)))
+    (execute-scan-morphism (make-scan-index-fn op 1 (bit 1) (bit 2) (bit 8) #f)
+                           out shape (if (bit 4) (list x s) (list x)) dt)
+    (srfi4->list out)))
+
+(define (scan-kernel-run be op dt outer n inner src seed flags)
+  (let ((out (if (eq? dt 'f32) (make-f32vector (* outer n inner)) (make-f64vector (* outer n inner)))))
+    ((lookup-scan-kernel be op dt) outer n inner src seed out flags)
+    (srfi4->list out)))
+
+(test-group "crunch kernels - scans equal execute-scan-morphism"
+  (let ((be (make-crunch-activation-backend)))
+    (for-each
+     (lambda (op)
+       (for-each
+        (lambda (dt make)
+          (for-each
+           (lambda (flags)
+             (test-assert (sprintf "~A ~A flags ~A" op dt flags)
+               (every (lambda (dims)
+                        (let* ((outer (car dims)) (n (cadr dims)) (inner (caddr dims))
+                               (src (values-vector make (* outer n inner)))
+                               (seed (values-vector make (max 1 (* outer inner)))))
+                          (same-lists? (scan-reference op dt outer n inner src seed flags)
+                                       (scan-kernel-run be op dt outer n inner src seed flags))))
+                      '((1 7 1) (3 5 1) (1 3 5) (2 3 4) (1 1 3) (4 1 2) (2 2 1) (3 64 33)))))
+           (iota 16)))
+        '(f32 f64)
+        (list make-f32vector make-f64vector)))
+     '(sum prod max min))
+    (test-assert "scan kernels are installed for every op and dtype in both backends"
+      (every (lambda (be)
+               (every (lambda (op) (and (lookup-scan-kernel be op 'f32) (lookup-scan-kernel be op 'f64)))
+                      '(sum prod max min)))
+             (list be (make-crunch-threaded-activation-backend))))
+    (test-error "a scan kernel rejects a source that is too short"
+      ((lookup-scan-kernel be 'sum 'f64) 2 3 4 (make-f64vector 23) (make-f64vector 1) (make-f64vector 24) 0))
+    (test-error "a scan kernel rejects a seed that is too short"
+      ((lookup-scan-kernel be 'sum 'f32) 2 3 4 (make-f32vector 24) (make-f32vector 7) (make-f32vector 24) 4))
+    (test-assert "a scan kernel ignores the seed without the seed flag"
+      (begin ((lookup-scan-kernel be 'max 'f32) 2 3 4 (make-f32vector 24) (make-f32vector 1) (make-f32vector 24) 3)
+             #t))))
+
+;; The tags of the ri-segop instructions of prog's replay plan.
+(define (plan-tags prog)
+  (filter-map (lambda (instr)
+                (cases replay-instruction instr
+                  (ri-segop (_ _ _ _ sg _ tag _) tag)
+                  (else #f)))
+              (vector->list (ssa-program-replay-plan prog))))
+
+(test-group "crunch kernels - scans in SSA replay"
+  (for-each
+   (lambda (make-be)
+     (register-activation-backend! (make-be))
+     (for-each
+      (lambda (dt)
+        (for-each
+         (lambda (spec)
+           (let* ((op (car spec)) (axis (cadr spec)) (excl (caddr spec)) (rev (cadddr spec))
+                  (vals (map (lambda (i) (* 0.37 (sin (* 1.3 i)))) (iota 60)))
+                  (make (lambda ()
+                          (morph-scan op (morph* (morph-from-list vals #(3 4 5) dt)
+                                                 (morph-from-list '(1.0) #(1) dt))
+                                      axis exclusive?: excl reverse?: rev))))
+             (let-values (((prog result) (replay-forward (make))))
+               (test-assert (sprintf "~A ~A ~A axis ~A: segop/scan-kernel" (activation-backend-name (active-activation-backend)) dt op axis)
+                 (memq 'segop/scan-kernel (plan-tags prog)))
+               (test-assert (sprintf "~A ~A ~A axis ~A: values equal realize" (activation-backend-name (active-activation-backend)) dt op axis)
+                 (same-lists? result (array-values (realize (make))))))))
+         '((sum 0 #f #f) (prod 1 #t #f) (max 2 #f #t) (min 1 #t #t))))
+      '(f32 f64)))
+   (list make-crunch-activation-backend make-crunch-threaded-activation-backend))
+  (register-activation-backend! #f))
+
 (test-exit)

@@ -21,6 +21,7 @@
 ;;;   Group 6 - Thread counts
 ;;;   Group 6b - seg-reduces, against the interpreter and the host executor
 ;;;   Group 6c - GEMM epilogues, against fusion off
+;;;   Group 6d - seg-scans: standard ops and combine expressions
 ;;;   Group 7 - The cache and compile failures
 ;;;   Group 8 - Native queries, SSA programs, training replays with
 ;;;             parameter updates, and the fusion class switches
@@ -36,6 +37,7 @@
         (only array-morphisms-blas-exec morph-matmul)
         (only array-morphisms-structural-ops morph-transpose)
         array-morphisms-context
+        (only array-morphisms-realization realize)
         array-morphisms-segop
         array-morphisms-scalar-ops
         (prefix array-morphisms-grad am:)
@@ -626,6 +628,141 @@
           (let ((sel (select-segop-executor (tcase-sg c))))
             (or (eq? (car sel) 'segop/codegen-red)
                 (not (memq (car sel) '(segop/strided-red segop/interpreted))))))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Group 6d - seg-scans
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; A seg-scan case over space (last dimension scanned) reading the arrays
+;; of env, a list of (slot array . index-map); the result is written to a
+;; row-major output of shape out-shape through out-map.
+(define (scan-case space env dt out-shape out-map body spec seed excl swapped)
+  (make-tcase (make-seg-scan space (map (lambda (e) (operand (car e) (cadr e) (cddr e))) env)
+                             (list (make-scan-result
+                                    (make-segop-operand 'res dt out-shape (compute-strides out-shape) 0 out-map)
+                                    body spec seed excl swapped)))
+              (map (lambda (e) (cons (car e) (cadr e))) env)
+              (list (shape-size out-shape))))
+
+;; Rows of a [rows cols] array scanned along the columns, forward or
+;; reversed, with an optional seed of one value per row.
+(define (row-scan-case dt rows cols spec #!key (excl #f) (rev #f) (seed? #f) (swapped #f) (body '(in 0)))
+  (let* ((m (if rev (exprs-map '(dim 0) `(+ ,(- cols 1) (* -1 (dim 1)))) (identity-index-map 2)))
+         (x (flat-array dt (vector rows cols) (if (memq dt '(f32 f64)) value-at (lambda (i) (- (modulo (* 7 i) 11) 5)))))
+         (s (flat-array dt (vector rows) (if (memq dt '(f32 f64)) value2-at (lambda (i) (- i 1))))))
+    (scan-case (vector rows cols)
+               (if seed? (list (cons* 'x x m) (cons* 's s (identity-index-map 1))) (list (cons* 'x x m)))
+               dt (vector rows cols) m body spec (and seed? '(in 1)) excl swapped)))
+
+(define (scan-results cases)
+  (let-values (((r notes) (check-cases cases))) r))
+
+(test-group "seg-scans"
+  (for-each
+   (lambda (dt)
+     (for-each
+      (lambda (spec-name)
+        (let* ((spec (case spec-name
+                       ((add) (make-combine-spec 'add 0.0 dt)) ((mul) (make-combine-spec 'mul 1.0 dt))
+                       ((max) (max-spec dt)) ((min) (min-spec dt))))
+               (cases (map (lambda (fl)
+                             (row-scan-case dt 3 11 spec excl: (car fl) rev: (cadr fl) seed?: (caddr fl)
+                                            swapped: (cadddr fl)))
+                           '((#f #f #f #f) (#t #f #f #f) (#f #t #t #f) (#t #t #t #t) (#f #f #t #t) (#t #f #t #f))))
+               (r (scan-results cases)))
+          (test-assert (sprintf "~a ~a: generated, and the interpreter's bits" dt spec-name)
+            (every (lambda (x) (and (eq? (car x) 'segop/codegen-scan) (cdr x))) r))))
+      '(add mul max min)))
+   '(f32 f64))
+
+  ;; Along the first axis of a transposed rank-3 array, and with integers.
+  (let* ((x (array 'f64 #(5 3 2) #(1 5 15) 0 30 value-at))
+         (c (scan-case #(3 2 5) (list (cons* 'x x (exprs-map '(dim 2) '(dim 0) '(dim 1))))
+                       'f64 #(5 3 2) (exprs-map '(dim 2) '(dim 0) '(dim 1))
+                       '(in 0) (make-combine-spec 'add 0.0 'f64) #f #f #f))
+         (r (scan-results (list c))))
+    (test-assert "a strided rank-3 source scanned along axis 0"
+      (and (eq? (car (car r)) 'segop/codegen-scan) (cdr (car r)))))
+  (let ((r (scan-results (list (row-scan-case 's32 4 9 (make-combine-spec 'add 0 's32) excl: #t)
+                               (row-scan-case 's32 4 9 (make-combine-spec 'max -2147483648 's32) seed?: #t)))))
+    (test-assert "s32 sums and maxima"
+      (every (lambda (x) (and (eq? (car x) 'segop/codegen-scan) (cdr x))) r)))
+
+  ;; Combine expressions.
+  (let ((r (scan-results
+            (list (row-scan-case 'f32 3 13 (make-combine-spec '(lambda (a b) (+ (cast f32 (* a 0.5)) b)) #f 'f32))
+                  (row-scan-case 'f64 3 13 (make-combine-spec '(lambda (a b) (- (* a 0.9) b)) #f 'f64)
+                                 rev: #t seed?: #t)
+                  (row-scan-case 'f64 3 13 (make-combine-spec '(lambda (acc x) (- acc (exp (* x 0.01)))) #f 'f64)
+                                 swapped: #t)
+                  (row-scan-case 'f32 3 13 (make-combine-spec '(lambda (a b) (* a b)) 1.0 'f32) excl: #t)
+                  (row-scan-case 'f64 3 13 (make-combine-spec '(lambda (a b) (+ a b)) #f 'f64)
+                                 body: '(mul (in 0) (in 0)))))))
+    (test-assert "combine expressions: generated, and the interpreter's bits"
+      (every (lambda (x) (and (eq? (car x) 'segop/codegen-scan) (cdr x))) r)))
+  (let ((r (scan-results (list (row-scan-case 'f64 2 5 (make-combine-spec '(lambda (a b) (if (> b a) b a)) #f 'f64))))))
+    (test "an expression with if stays on the host" 'segop/strided-scan (car (car r)))
+    (test-assert "and gives the interpreter's bits" (cdr (car r))))
+
+  ;; Thread counts: the lines are the jobs.
+  (let* ((c (row-scan-case 'f32 37 19 (make-combine-spec 'add 0.0 'f32) seed?: #t)))
+    (let-values (((sels notes) (cg-select-all (list (tcase-sg c)))))
+      (let ((ref (run-reference c)))
+        (for-each
+         (lambda (t)
+           (test-assert (sprintf "scan with ~a threads gives the interpreter's bits" t)
+             (parameterize ((crunch-codegen-threads t) (crunch-thread-min-chunk 1))
+               (every same-bits? (run-executor (cdr (car sels)) c) ref))))
+         '(1 3 8)))))
+
+  ;; With every backend registered (registry, code generator, scheme), a
+  ;; scan the registry cannot run with a kernel goes to the code generator.
+  (let* ((x (morph-transpose (morph* (morph-from-list (map (lambda (i) (* 0.3 (sin (* 1.7 i)))) (iota 60)) #(3 4 5) 'f64)
+                                     (morph-from-list '(1.0) #(1) 'f64))
+                             '(0 2 1)))
+         (prog (morphism-to-ssa (am:make-var (morph-cumsum x 2) #f)))
+         (ctx (make-morphism-context)))
+    (parameterize ((segop-backends (parameterize ((segop-backends (segop-backends)))
+                                     (register-crunch-codegen-backend!)
+                                     (segop-backends)))
+                   (crunch-codegen #t))
+      (ssa-realize/ctx ctx prog)
+      (finalize-context! ctx) (reset-context! ctx)
+      (ssa-realize/ctx ctx prog) (reset-context! ctx)
+      (test-assert "with the registry backend in front, a strided scan is generated"
+        (memq 'segop/codegen-scan
+              (map (lambda (instr) (cases replay-instruction instr
+                                     (ri-segop (_ _ _ _ sg _ tag _) tag)
+                                     (else #f)))
+                   (vector->list (ssa-program-replay-plan prog)))))))
+
+  ;; In an SSA program, with the code generator in front of the scheme backend.
+  (for-each
+   (lambda (dt)
+     (let* ((make (lambda ()
+                    (let ((x (morph* (morph-from-list (map (lambda (i) (* 0.3 (sin (* 1.7 i)))) (iota 60)) #(3 4 5) dt)
+                                     (morph-from-list '(1.0) #(1) dt))))
+                      (morph-exp (morph-scan `(lambda (a b) (+ (cast ,dt (* a 0.75)) b)) x 1 reverse?: #t)))))
+            (prog (morphism-to-ssa (am:make-var (make) #f)))
+            (ctx (make-morphism-context))
+            (vals (lambda (m) (cases array-morphism m
+                                (concrete-array (d shape st off dt _ _)
+                                  (map (lambda (i) (typed-vector-ref d dt (multi-to-linear-index (linear-to-multi-index i shape) st off)))
+                                       (iota (shape-size shape))))
+                                (else #f)))))
+       (parameterize ((segop-backends (cg-backends)) (crunch-codegen #t))
+         (ssa-realize/ctx ctx prog)
+         (finalize-context! ctx) (reset-context! ctx)
+         (ssa-realize/ctx ctx prog) (reset-context! ctx)
+         (let ((out (vals (car (ssa-realize/ctx ctx prog))))
+               (tags (map (lambda (instr) (cases replay-instruction instr
+                                            (ri-segop (_ _ _ _ sg _ tag _) tag)
+                                            (else #f)))
+                          (vector->list (ssa-program-replay-plan prog)))))
+           (test-assert (sprintf "~a SSA scan: segop/codegen-scan" dt) (memq 'segop/codegen-scan tags))
+           (test-assert (sprintf "~a SSA scan: values equal realize" dt)
+             (every same-element? out (vals (realize (make)))))))))
+   '(f32 f64)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Group 6c - GEMM epilogues

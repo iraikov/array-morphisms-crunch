@@ -633,10 +633,161 @@
                                        (iota nres))))
                          members)))))))
 
+  ;;; A seg-scan kernel scans the lines of its space, one parallel point
+  ;;; per job, as execute-scan-morphism in array-morphisms does.  It keeps
+  ;;; no running value: at each position it reads the value it stored at
+  ;;; the position before, which is the value so far rounded to the
+  ;;; output's dtype, and combines it with the new element.  An inclusive
+  ;;; scan stores at position 0 the element (or the seed combined with it),
+  ;;; and an exclusive scan stores there the seed (or the neutral element)
+  ;;; and at position r + 1 what the inclusive scan stores at r.
+  ;;;
+  ;;; The bodies of a scan kernel specification are a list
+  ;;; (value seed step neutral exclusive?):
+  ;;;   value:      the scan's body, over the inputs;
+  ;;;   seed:       #f, or the index of the input read as the seed;
+  ;;;   step:       (std op swapped?) for a combine op add, mul, max or
+  ;;;               min, or (expr e) for a combine expression, e a body
+  ;;;               whose (in 0) is the value so far and (in 1) the element;
+  ;;;   neutral:    the neutral element, or #f;
+  ;;;   exclusive?: #t for an exclusive scan.
+
+  (define (scan-step-desc spec swapped?)
+    (let ((op (combine-spec-op spec)))
+      (cond ((memq op '(add mul max min)) (list 'std op swapped?))
+            ((combine-expression? op)
+             (let* ((vars (cadr op))
+                    (body (substitute-vars (caddr op)
+                                           (if swapped?
+                                               (list (cons (car vars) '(in 1)) (cons (cadr vars) '(in 0)))
+                                               (list (cons (car vars) '(in 0)) (cons (cadr vars) '(in 1)))))))
+               (and body (list 'expr body))))
+            (else #f))))
+
+  ;; e with each variable of the alist subst replaced by its body, or #f
+  ;; when e binds variables itself.
+  (define (substitute-vars e subst)
+    (call-with-current-continuation
+     (lambda (k)
+       (let walk ((e e))
+         (cond ((symbol? e) (let ((p (assq e subst))) (if p (cdr p) e)))
+               ((not (pair? e)) e)
+               ((eq? (car e) 'let*) (k #f))
+               ((eq? (car e) 'cast) (list 'cast (cadr e) (walk (caddr e))))
+               (else (cons (car e) (map walk (cdr e)))))))))
+
+  ;; The statements of one parallel point of a scan kernel, as
+  ;; (form may-fail?), or #f when a body is not translated.
+  ;;   in-dts, odt: the dtypes of the inputs and of the output;
+  ;;   read:        (read k r) is the form reading input k at position r;
+  ;;   out-off:     (out-off r) is the output's offset at position r;
+  ;;   n:           the form of the scan length.
+  (define (scan-statements bodies in-dts odt read out-off n)
+    (let* ((value (list-ref bodies 0)) (seed (list-ref bodies 1)) (step (list-ref bodies 2))
+           (neutral (list-ref bodies 3)) (excl? (list-ref bodies 4))
+           (otype (codegen-dtype-type odt))
+           (oref (vector-ref-name odt)) (oset (vector-set-name odt))
+           (ov (v-name (length in-dts)))
+           (fails? #f))
+      (define (note! f?) (when f? (set! fails? #t)))
+      (define (store a)
+        (let-values (((form f?) (typed-store-form odt a helper-name))) (note! f?) form))
+      ;; (bindings . atom) of the step combining the pairs acc and v
+      (define (combine acc v)
+        (if (eq? (car step) 'std)
+            (let ((op (cadr step)) (sw? (caddr step)))
+              (if (memq op '(max min))
+                  (let-values (((form f?) (typed-combine-form op (if sw? v acc) (if sw? acc v) odt helper-name)))
+                    (note! f?)
+                    (cons '() (cons form otype)))
+                  (let ((tr (translate-typed-bodies (list (if sw? `(,op (in 1) (in 0)) `(,op (in 0) (in 1))))
+                                                    (lambda (k) (if (= k 0) acc v)) helper-name)))
+                    (and tr (begin (note! (caddr tr)) (cons (car tr) (car (cadr tr))))))))
+            (let ((tr (translate-typed-bodies (list (cadr step)) (lambda (k) (if (= k 0) acc v)) helper-name)))
+              (and tr (begin (note! (caddr tr)) (cons (car tr) (car (cadr tr))))))))
+      ;; the statement storing at position at the step of acc-form and %v
+      (define (step-store acc-form at)
+        (let ((c (combine (cons '%a otype) (cons '%v vtype))))
+          (and c `(let* ((%a ,acc-form) ,@(car c)) (,oset ,ov ,(out-off at) ,(store (cdr c)))))))
+      (define vtype #f)
+      (let ((vtr (translate-typed-bodies (list value) (lambda (k) (cons (read k '%r) (codegen-dtype-type (list-ref in-dts k))))
+                                         helper-name)))
+        (and vtr
+             (begin
+               (note! (caddr vtr))
+               (set! vtype (cdr (car (cadr vtr))))
+               (let* ((seed-read (and seed (read seed 0)))
+                      (at        (if excl? '(+ %r 1) '%r))
+                      (first     (if seed
+                                     (step-store seed-read at)
+                                     `(,oset ,ov ,(out-off at) ,(store (cons '%v vtype)))))
+                      (later     (step-store `(,oref ,ov ,(out-off (if excl? '%r '(- %r 1)))) at)))
+                 (and first later
+                      (list
+                       `(begin
+                          ,@(if excl?
+                                `((when (> ,n 0)
+                                    (,oset ,ov ,(out-off 0)
+                                           ,(if seed
+                                                (store (cons seed-read otype))
+                                                (store (cons neutral (if (exact-integer? neutral) 'i 'f)))))))
+                                '())
+                          (do ((%r 0 (+ %r 1))) ((>= %r ,(if excl? `(- ,n 1) n)))
+                            (let* (,@(car vtr) (%v ,(car (car (cadr vtr)))))
+                              (if (= %r 0) ,first ,later))))
+                       fails?))))))))
+
+  (define (scan-kernel-forms k spec)
+    (let* ((rank    (kspec-rank spec))
+           (npar    (- rank 1))
+           (ins     (kspec-in-dtypes spec))
+           (odt     (car (kspec-out-dtypes spec)))
+           (n       (length ins))
+           (nops    (+ n 1))
+           (name    (sym "am_g" id-placeholder "_k" k))
+           (e       (lambda (d) (sym "%e" d)))
+           (b       (lambda (j) (sym "%b" j)))
+           (c       (lambda (j d) (sym "%c" j "_" d)))
+           (i       (lambda (d) (sym "%i" d)))
+           (po      (lambda (j) (sym "%po" j)))
+           (ops     (iota nops))
+           (dims    (iota rank))
+           (pdims   (iota npar))
+           (dt-of   (lambda (j) (if (< j n) (list-ref ins j) odt)))
+           (st      (scan-statements (kspec-bodies spec) ins odt
+                                     (lambda (k r) `(,(vector-ref-name (list-ref ins k)) ,(v-name k)
+                                                     (+ ,(po k) (* ,r ,(c k npar)))))
+                                     (lambda (r) `(+ ,(po n) (* ,r ,(c n npar))))
+                                     (e npar)))
+           (params  (append (map (lambda (d) (list (e d) `(s64vector-ref ip ,d))) dims)
+                            (apply append
+                                   (map (lambda (j)
+                                          (let ((at (+ rank (* j (+ rank 1)))))
+                                            (cons (list (b j) `(s64vector-ref ip ,at))
+                                                  (map (lambda (d) (list (c j d) `(s64vector-ref ip ,(+ at 1 d))))
+                                                       dims))))
+                                        ops)))))
+      (list
+       `(: (,name integer integer s64vector f64vector ,@(map (lambda (j) (vector-type (dt-of j))) ops)) void)
+       `(define (,name start end ip sc ,@(map v-name ops))
+          (let* ,params
+            (do ((%p start (+ %p 1))) ((>= %p end))
+              (let* (,@(apply append
+                              (map (lambda (d)
+                                     (let ((q (if (= d (- npar 1)) '%p (sym "%q" (+ d 1)))))
+                                       `((,(i d) (remainder ,q ,(e d)))
+                                         (,(sym "%q" d) (quotient ,q ,(e d))))))
+                                   (reverse pdims)))
+                     ,@(map (lambda (j)
+                              (list (po j) (sum-form (cons (b j) (map (lambda (d) `(* ,(c j d) ,(i d))) pdims)))))
+                            ops))
+                ,(car st))))))))
+
   (define (kernel-forms k spec)
     (case (kspec-kind spec)
       ((map) (map-kernel-forms k spec))
       ((red) (red-kernel-forms k spec))
+      ((scan) (scan-kernel-forms k spec))
       (else (error 'crunch-codegen "unknown kernel kind" (kspec-kind spec)))))
 
   ;; The C run procedure of kernel k (see crunch-dispatch-n.h).
@@ -1154,6 +1305,63 @@
                                       (car batch)))
                       (cons 'segop/codegen-red (segop-executor-cell-executor cell))))))))))
 
+  ;; A seg-scan the backends after this one run with a Scheme loop
+  ;; (segop/scan, segop/strided-scan or the interpreter): one result whose
+  ;; accumulator has the output's dtype, the sequential order, linear
+  ;; operands, a seed read as an input of the output's dtype, and a step
+  ;; and body the translator accepts.  Its lines are the jobs of the
+  ;; thread pool.
+  (define (scan-select sg space ins results)
+    (let* ((rank (vector-length space))
+           (host (select-segop-executor sg 'crunch-codegen)))
+      (and host
+           (memq (car host) '(segop/scan segop/strided-scan segop/interpreted))
+           (= (length results) 1)
+           (<= 1 rank max-red-rank)
+           (let* ((res  (car results))
+                  (out  (scan-result-out res))
+                  (odt  (segop-operand-dtype out))
+                  (spec (scan-result-combine res))
+                  (in-dts (map segop-operand-dtype ins))
+                  (seed (scan-result-seed res))
+                  (seed-k (and seed (pair? seed) (eq? (car seed) 'in) (cadr seed)))
+                  (step (scan-step-desc spec (scan-result-swapped? res)))
+                  (excl? (and (scan-result-exclusive? res) #t))
+                  (neutral (let ((v (combine-spec-neutral spec)))
+                             (and v (round-to-dtype v odt))))
+                  (bodies (list (symbolic-body (scan-result-body res)) seed-k step neutral excl?)))
+             (and (memq odt codegen-dtypes)
+                  (every (lambda (dt) (memq dt codegen-dtypes)) in-dts)
+                  (eq? (combine-spec-acc-dtype spec) odt)
+                  (memq (combine-spec-order spec) '(sequential unspecified))
+                  step
+                  (or (not seed) (and seed-k (eq? (list-ref in-dts seed-k) odt)))
+                  (or (not excl?) seed neutral)
+                  (<= (+ (length ins) 1) crunch-dispatch-n-max-vectors)
+                  (let ((lins (linear-forms (append ins (list out)) rank))
+                        (st   (scan-statements bodies in-dts odt (lambda (k r) 0) (lambda (r) 0) 1)))
+                    (and lins st
+                         (let* ((kspec (make-kspec 'scan rank in-dts (list odt) bodies
+                                                   (kspec-key-string 'scan rank in-dts (list odt) bodies)))
+                                (cell  (make-segop-executor-cell (cdr host)))
+                                (npar  (- rank 1))
+                                (ip    (kernel-ip space lins))
+                                (batch (plan-batch)))
+                           (set-car! batch
+                                     (cons (cons kspec
+                                                 (lambda (kern)
+                                                   (segop-executor-cell-set!
+                                                    cell
+                                                    (kernel-executor kern (cadr st)
+                                                                     (shape-size (subvector space 0 npar))
+                                                                     (map segop-operand-slot ins) 1
+                                                                     ip no-scalars
+                                                                     (kernel-esz (append in-dts (list odt)))
+                                                                     (cdr host)
+                                                                     (max 1 (vector-ref space npar))))))
+                                           (car batch)))
+                           (cons 'segop/codegen-scan (segop-executor-cell-executor cell))))))))))
+
   (define (codegen-select sg)
     (and (crunch-codegen)
          (segop-plan-context)
@@ -1161,6 +1369,7 @@
            (seg-map (space ins outs bodies fallback) (map-select sg space ins outs bodies))
            (seg-reduce (space nred ins results map-outs fallback)
              (and (> nred 0) (red-select sg space nred ins results map-outs)))
+           (seg-scan (space ins results fallback) (scan-select sg space ins results))
            (else #f))))
 
   ;;;; ============================================================

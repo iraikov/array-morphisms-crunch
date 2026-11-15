@@ -722,6 +722,102 @@
      (list 'min 1 %k-min-axis1-f32 %k-min-axis1-f64)))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; Scan kernels
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  ;; %k-scan-<op>-<order>-<t> scans the row-major outer x n x inner array src
+  ;; along its middle axis into out, as execute-scan-morphism in
+  ;; array-morphisms does.  flags (below 8) holds 1 for an exclusive scan,
+  ;; 2 for a reversed one and 4 when seed, a row-major outer x inner array,
+  ;; holds the values the lines start from.  order is acc when each step
+  ;; is (op acc x) and elt when it is (op x acc).  The kernel walks the
+  ;; positions of the axis in the scan's order and, at each, the inner
+  ;; elements, whose lines are independent:
+  ;;   * an inclusive scan stores at the first position x (or seed op x),
+  ;;     and at every later one the stored value of the position before
+  ;;     combined with x;
+  ;;   * an exclusive scan stores at the first position seed (or the
+  ;;     neutral element), at the second x of the first position (or seed
+  ;;     op it), and at every later one the stored value of the position
+  ;;     before combined with x of the position before.
+  ;; Every value is stored before it is used again, so f32 scans round at
+  ;; every step; max and min replace the value so far only when the
+  ;; comparison holds, so a NaN element is passed over.
+  ;;
+  ;; (define-crunch-scans (op neutral (a x) step) ...) defines the kernels
+  ;; of each op, step being the expression of a and x, and binds
+  ;; %crunch-scan-table to a list of
+  ;;   (op f32-acc-kernel f64-acc-kernel f32-elt-kernel f64-elt-kernel).
+  (define-syntax define-crunch-scans
+    (er-macro-transformer
+     (lambda (form r c)
+       (define (name op order dtype)
+         (string->symbol (string-append "%k-scan-" (symbol->string op) "-" (symbol->string order)
+                                        "-" (symbol->string dtype))))
+       (define (kernel op neutral a x step order dtype)
+         (let* ((vec (if (eq? dtype 'f32) 'f32vector 'f64vector))
+                (ref (if (eq? dtype 'f32) 'f32vector-ref 'f64vector-ref))
+                (set (if (eq? dtype 'f32) 'f32vector-set! 'f64vector-set!))
+                (k   (name op order dtype))
+                ;; the step combining acc-form with x-form
+                (comb (lambda (acc-form x-form)
+                        (if (eq? order 'acc)
+                            `(let ((,a ,acc-form) (,x ,x-form)) ,step)
+                            `(let ((,a ,x-form) (,x ,acc-form)) ,step))))
+                (row (lambda (value) `(do ((i 0 (+ i 1))) ((= i inner)) (,set out (+ b i) ,value)))))
+           `(,(r 'crunch)
+             (: (,k integer integer integer ,vec ,vec ,vec integer) void)
+             (define (,k outer n inner src seed out flags)
+               (let ((excl (remainder flags 2))
+                     (rev  (remainder (quotient flags 2) 2))
+                     (hs   (remainder (quotient flags 4) 2)))
+                 (do ((o 0 (+ o 1))) ((= o outer))
+                   (do ((r 0 (+ r 1))) ((= r n))
+                     (let* ((pos (if (= rev 1) (- (- n 1) r) r))
+                            (prev (if (= rev 1) (+ pos 1) (- pos 1)))
+                            (b  (* (+ (* o n) pos) inner))
+                            (pb (* (+ (* o n) prev) inner))
+                            (sb (* o inner)))
+                       (if (= excl 0)
+                           (if (= r 0)
+                               (if (= hs 1)
+                                   ,(row (comb `(,ref seed (+ sb i)) `(,ref src (+ b i))))
+                                   ,(row `(,ref src (+ b i))))
+                               ,(row (comb `(,ref out (+ pb i)) `(,ref src (+ b i)))))
+                           (if (= r 0)
+                               (if (= hs 1)
+                                   ,(row `(,ref seed (+ sb i)))
+                                   ,(row neutral))
+                               (if (= r 1)
+                                   (if (= hs 1)
+                                       ,(row (comb `(,ref seed (+ sb i)) `(,ref src (+ pb i))))
+                                       ,(row `(,ref src (+ pb i))))
+                                   ,(row (comb `(,ref out (+ pb i)) `(,ref src (+ pb i)))))))))))))))
+       (let ((entries (cdr form)))
+         `(,(r 'begin)
+           ,@(apply append
+                    (map (lambda (e)
+                           (let ((op (car e)) (neutral (cadr e))
+                                 (a (car (caddr e))) (x (cadr (caddr e))) (step (cadddr e)))
+                             (map (lambda (od) (kernel op neutral a x step (car od) (cadr od)))
+                                  '((acc f32) (acc f64) (elt f32) (elt f64)))))
+                         entries))
+           (,(r 'define) %crunch-scan-table
+            (,(r 'list)
+             ,@(map (lambda (e)
+                      (let ((op (car e)))
+                        `(,(r 'list) (,(r 'quote) ,op)
+                                     ,(name op 'acc 'f32) ,(name op 'acc 'f64)
+                                     ,(name op 'elt 'f32) ,(name op 'elt 'f64))))
+                    entries))))))))
+
+  (define-crunch-scans
+    (sum  0.0    (a x) (+ a x))
+    (prod 1.0    (a x) (* a x))
+    (max  -inf.0 (a x) (if (> x a) x a))
+    (min  +inf.0 (a x) (if (< x a) x a)))
+
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Strided copy kernels
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -1031,6 +1127,28 @@
           (list (caddr entry) (cadddr entry))
           (list f32vector-length f64vector-length))))
      %crunch-reduction-table)
+    (for-each
+     (lambda (entry)
+       (let ((op (car entry)))
+         (for-each
+          (lambda (dtype acc-kernel elt-kernel vec-length)
+            (activation-backend-add-scan-kernel!
+             be op dtype
+             (lambda (outer n inner src seed out flags)
+               (let ((cells (and (fixnum? outer) (fixnum? n) (fixnum? inner)
+                                 (>= outer 0) (>= n 0) (>= inner 0)
+                                 (* outer n inner))))
+                 (unless (and cells (fixnum? flags) (<= 0 flags 15)
+                              (<= cells (vec-length src)) (<= cells (vec-length out))
+                              (or (< (remainder flags 8) 4)
+                                  (<= (* outer inner) (vec-length seed))))
+                   (error op "scan operands do not fit their vectors" outer n inner flags)))
+               ((if (>= flags 8) elt-kernel acc-kernel) outer n inner src seed out (remainder flags 8)))))
+          '(f32 f64)
+          (list (list-ref entry 1) (list-ref entry 2))
+          (list (list-ref entry 3) (list-ref entry 4))
+          (list f32vector-length f64vector-length))))
+     %crunch-scan-table)
     (for-each
      (lambda (dtype kernel vec-length)
        (activation-backend-add-copy-kernel! be dtype (checked-copy kernel vec-length)))
