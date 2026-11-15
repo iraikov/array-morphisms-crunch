@@ -704,6 +704,44 @@
     (test "an expression with if stays on the host" 'segop/strided-scan (car (car r)))
     (test-assert "and gives the interpreter's bits" (cdr (car r))))
 
+  ;; Tiles of consecutive lines: full tiles and the lines after them, a
+  ;; parallel space of rank 2 whose last extent is not a multiple of the
+  ;; tile, and the columns of a row-major array (a scan along axis 0),
+  ;; with every flag set, for each thread count.
+  (let* ((col-case
+          (lambda (dt spec excl seed? rev)
+            (let* ((n 9) (cols 21)
+                   (m (exprs-map (if rev `(+ ,(- n 1) (* -1 (dim 1))) '(dim 1)) '(dim 0)))
+                   (x (flat-array dt (vector n cols) value-at))
+                   (sd (flat-array dt (vector cols) value2-at)))
+              (scan-case (vector cols n)
+                         (if seed? (list (cons* 'x x m) (cons* 's sd (identity-index-map 1))) (list (cons* 'x x m)))
+                         dt (vector n cols) m '(in 0) spec (and seed? '(in 1)) excl #f))))
+         (r3-case
+          (lambda (dt spec)
+            (let ((x (flat-array dt #(5 13 6) value-at)))
+              (scan-case #(5 13 6) (list (cons* 'x x (identity-index-map 3))) dt #(5 13 6)
+                         (identity-index-map 3) '(in 0) spec #f #f #f))))
+         (cases (append
+                 (list (row-scan-case 'f32 37 19 (make-combine-spec 'add 0.0 'f32))
+                       (row-scan-case 'f64 29 7 (make-combine-spec 'max -inf.0 'f64) excl: #t rev: #t seed?: #t)
+                       (r3-case 'f32 (make-combine-spec 'mul 1.0 'f32))
+                       (r3-case 'f64 (make-combine-spec '(lambda (a b) (- (* a 0.5) b)) #f 'f64)))
+                 (map (lambda (fl) (col-case 'f32 (make-combine-spec 'add 0.0 'f32) (car fl) (cadr fl) (caddr fl)))
+                      '((#f #f #f) (#t #t #f) (#f #t #t) (#t #f #t)))
+                 (list (col-case 'f64 (make-combine-spec 'min +inf.0 'f64) #f #t #f)
+                       (col-case 'f32 (make-combine-spec '(lambda (a b) (+ (cast f32 (* a 0.9)) b)) #f 'f32) #f #f #t)))))
+    (let-values (((sels notes) (cg-select-all (map tcase-sg cases))))
+      (for-each
+       (lambda (t)
+         (test-assert (sprintf "tiled scans with ~a threads give the interpreter's bits" t)
+           (parameterize ((crunch-codegen-threads t) (crunch-thread-min-chunk 1))
+             (every (lambda (sel c)
+                      (and (eq? (car sel) 'segop/codegen-scan)
+                           (every same-bits? (run-executor (cdr sel) c) (run-reference c))))
+                    sels cases))))
+       '(1 3 7))))
+
   ;; Thread counts: the lines are the jobs.
   (let* ((c (row-scan-case 'f32 37 19 (make-combine-spec 'add 0.0 'f32) seed?: #t)))
     (let-values (((sels notes) (cg-select-all (list (tcase-sg c)))))

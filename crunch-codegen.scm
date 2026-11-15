@@ -677,7 +677,9 @@
                (else (cons (car e) (map walk (cdr e)))))))))
 
   ;; The statements of one parallel point of a scan kernel, as
-  ;; (form may-fail?), or #f when a body is not translated.
+  ;; (pre body end may-fail?), or #f when a body is not translated: pre
+  ;; is a list of statements run first, body the statement run at each
+  ;; position %r from 0 below end.
   ;;   in-dts, odt: the dtypes of the inputs and of the output;
   ;;   read:        (read k r) is the form reading input k at position r;
   ;;   out-off:     (out-off r) is the output's offset at position r;
@@ -724,18 +726,33 @@
                       (later     (step-store `(,oref ,ov ,(out-off (if excl? '%r '(- %r 1)))) at)))
                  (and first later
                       (list
-                       `(begin
-                          ,@(if excl?
-                                `((when (> ,n 0)
-                                    (,oset ,ov ,(out-off 0)
-                                           ,(if seed
-                                                (store (cons seed-read otype))
-                                                (store (cons neutral (if (exact-integer? neutral) 'i 'f)))))))
-                                '())
-                          (do ((%r 0 (+ %r 1))) ((>= %r ,(if excl? `(- ,n 1) n)))
-                            (let* (,@(car vtr) (%v ,(car (car (cadr vtr)))))
-                              (if (= %r 0) ,first ,later))))
+                       (if excl?
+                           `((when (> ,n 0)
+                               (,oset ,ov ,(out-off 0)
+                                      ,(if seed
+                                           (store (cons seed-read otype))
+                                           (store (cons neutral (if (exact-integer? neutral) 'i 'f)))))))
+                           '())
+                       `(let* (,@(car vtr) (%v ,(car (car (cadr vtr)))))
+                          (if (= %r 0) ,first ,later))
+                       (if excl? `(- ,n 1) n)
                        fails?))))))))
+
+  ;;; A seg-scan kernel scans scan-tile-size consecutive lines together
+  ;;; when they lie along the last parallel dimension: at each position it
+  ;;; computes the next value of every line of the tile.  Each line
+  ;;; combines the same values in the same order as on its own, so the
+  ;;; results are the same.  When the lines are the columns of a row-major
+  ;;; array (a scan along its first axis), the tile reads and writes
+  ;;; neighbouring elements at each position.
+  (define scan-tile-size 8)
+
+  ;; The statement scanning the lines of scan statements st (see
+  ;; scan-statements) from position 0 on.
+  (define (scan-loop sts)
+    `(begin ,@(apply append (map car sts))
+            (do ((%r 0 (+ %r 1))) ((>= %r ,(caddr (car sts))))
+              ,@(map cadr sts))))
 
   (define (scan-kernel-forms k spec)
     (let* ((rank    (kspec-rank spec))
@@ -754,11 +771,24 @@
            (dims    (iota rank))
            (pdims   (iota npar))
            (dt-of   (lambda (j) (if (< j n) (list-ref ins j) odt)))
-           (st      (scan-statements (kspec-bodies spec) ins odt
-                                     (lambda (k r) `(,(vector-ref-name (list-ref ins k)) ,(v-name k)
-                                                     (+ ,(po k) (* ,r ,(c k npar)))))
-                                     (lambda (r) `(+ ,(po n) (* ,r ,(c n npar))))
-                                     (e npar)))
+           ;; the statements of the line whose operand offsets are (base j)
+           (line    (lambda (base)
+                      (scan-statements (kspec-bodies spec) ins odt
+                                       (lambda (k r) `(,(vector-ref-name (list-ref ins k)) ,(v-name k)
+                                                       (+ ,(base k) (* ,r ,(c k npar)))))
+                                       (lambda (r) `(+ ,(base n) (* ,r ,(c n npar))))
+                                       (e npar))))
+           (single  (scan-loop (list (line po))))
+           (last    (- npar 1))
+           (pt      (lambda (j t) (sym "%po" j "t" t)))
+           (tile    (and (> npar 0)
+                         `(let* ,(apply append
+                                        (map (lambda (t)
+                                               (map (lambda (j) (list (pt j t) `(+ ,(po j) (* ,t ,(c j last)))))
+                                                    ops))
+                                             (iota scan-tile-size)))
+                            ,(scan-loop (map (lambda (t) (line (lambda (j) (pt j t))))
+                                             (iota scan-tile-size))))))
            (params  (append (map (lambda (d) (list (e d) `(s64vector-ref ip ,d))) dims)
                             (apply append
                                    (map (lambda (j)
@@ -771,17 +801,23 @@
        `(: (,name integer integer s64vector f64vector ,@(map (lambda (j) (vector-type (dt-of j))) ops)) void)
        `(define (,name start end ip sc ,@(map v-name ops))
           (let* ,params
-            (do ((%p start (+ %p 1))) ((>= %p end))
-              (let* (,@(apply append
-                              (map (lambda (d)
-                                     (let ((q (if (= d (- npar 1)) '%p (sym "%q" (+ d 1)))))
-                                       `((,(i d) (remainder ,q ,(e d)))
-                                         (,(sym "%q" d) (quotient ,q ,(e d))))))
-                                   (reverse pdims)))
-                     ,@(map (lambda (j)
-                              (list (po j) (sum-form (cons (b j) (map (lambda (d) `(* ,(c j d) ,(i d))) pdims)))))
-                            ops))
-                ,(car st))))))))
+            (let ((%step 1))
+              (do ((%p start (+ %p %step))) ((>= %p end))
+                (let* (,@(apply append
+                                (map (lambda (d)
+                                       (let ((q (if (= d (- npar 1)) '%p (sym "%q" (+ d 1)))))
+                                         `((,(i d) (remainder ,q ,(e d)))
+                                           (,(sym "%q" d) (quotient ,q ,(e d))))))
+                                     (reverse pdims)))
+                       ,@(map (lambda (j)
+                                (list (po j) (sum-form (cons (b j) (map (lambda (d) `(* ,(c j d) ,(i d))) pdims)))))
+                              ops))
+                  ,(if tile
+                       `(if (and (<= (+ %p ,scan-tile-size) end)
+                                 (<= (+ ,(i last) ,scan-tile-size) ,(e last)))
+                            (begin ,tile (set! %step ,scan-tile-size))
+                            (begin ,single (set! %step 1)))
+                       single)))))))))
 
   (define (kernel-forms k spec)
     (case (kspec-kind spec)
@@ -1352,7 +1388,7 @@
                                                  (lambda (kern)
                                                    (segop-executor-cell-set!
                                                     cell
-                                                    (kernel-executor kern (cadr st)
+                                                    (kernel-executor kern (cadddr st)
                                                                      (shape-size (subvector space 0 npar))
                                                                      (map segop-operand-slot ins) 1
                                                                      ip no-scalars
