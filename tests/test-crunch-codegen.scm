@@ -794,6 +794,42 @@
                     sels cases))))
        '(1 3 7))))
 
+  ;; Scans with aux values: a linear recurrence and a recurrence gated by
+  ;; a 0/1 mask, forward and reversed, with a seed, over 37 lines (tiles
+  ;; and the lines after them), for several thread counts.
+  (let* ((aux-case
+          (lambda (dt expr rev seed?)
+            (let* ((rows 37) (cols 11)
+                   (m (if rev (exprs-map '(dim 0) `(+ ,(- cols 1) (* -1 (dim 1)))) (identity-index-map 2)))
+                   (x (flat-array dt (vector rows cols) value-at))
+                   (c (flat-array dt (vector rows cols) (lambda (i) (if (= 0 (modulo (* 7 i) 3)) 1.0 0.0))))
+                   (sd (flat-array dt (vector rows) value2-at)))
+              (make-tcase
+               (make-seg-scan (vector rows cols)
+                              (append (list (operand 'x x m))
+                                      (if seed? (list (operand 's sd (identity-index-map 1))) '())
+                                      (list (operand 'c c m)))
+                              (list (make-scan-result
+                                     (make-segop-operand 'res dt (vector rows cols) (compute-strides (vector rows cols)) 0 m)
+                                     '(in 0) (make-combine-spec expr #f dt) (and seed? '(in 1)) #f #f
+                                     (list (if seed? '(in 2) '(in 1))))))
+               (append (list (cons 'x x)) (if seed? (list (cons 's sd)) '()) (list (cons 'c c)))
+               (list (* rows cols))))))
+         (cases (list (aux-case 'f64 '(lambda (a b c) (+ b (* c a))) #f #f)
+                      (aux-case 'f32 '(lambda (a b c) (+ b (cast f32 (* c a)))) #t #t)
+                      (aux-case 'f64 '(lambda (a b c) (if (> c 0.5) (+ b a) b)) #t #f)
+                      (aux-case 'f32 '(lambda (a b c) (if (> c 0.5) (+ b a) b)) #f #t))))
+    (let-values (((sels notes) (cg-select-all (map tcase-sg cases))))
+      (for-each
+       (lambda (t)
+         (test-assert (sprintf "aux scans with ~a threads: generated, with the interpreter's bits" t)
+           (parameterize ((crunch-codegen-threads t) (crunch-thread-min-chunk 1))
+             (every (lambda (sel c)
+                      (and (eq? (car sel) 'segop/codegen-scan)
+                           (every same-bits? (run-executor (cdr sel) c) (run-reference c))))
+                    sels cases))))
+       '(1 3))))
+
   ;; Thread counts: the lines are the jobs.
   (let* ((c (row-scan-case 'f32 37 19 (make-combine-spec 'add 0.0 'f32) seed?: #t)))
     (let-values (((sels notes) (cg-select-all (list (tcase-sg c)))))

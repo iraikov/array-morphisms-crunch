@@ -643,14 +643,17 @@
   ;;; and at position r + 1 what the inclusive scan stores at r.
   ;;;
   ;;; The bodies of a scan kernel specification are a list
-  ;;; (value seed step neutral exclusive?):
+  ;;; (value seed step neutral exclusive? aux):
   ;;;   value:      the scan's body, over the inputs;
   ;;;   seed:       #f, or the index of the input read as the seed;
   ;;;   step:       (std op swapped?) for a combine op add, mul, max or
   ;;;               min, or (expr e) for a combine expression, e a body
   ;;;               whose (in 0) is the value so far and (in 1) the element;
   ;;;   neutral:    the neutral element, or #f;
-  ;;;   exclusive?: #t for an exclusive scan.
+  ;;;   exclusive?: #t for an exclusive scan;
+  ;;;   aux:        the bodies of the extra values a combine expression
+  ;;;               receives, read at the current position; its (in 2),
+  ;;;               (in 3) ... in the step.
 
   (define (scan-step-desc spec swapped?)
     (let ((op (combine-spec-op spec)))
@@ -658,9 +661,12 @@
             ((combine-expression? op)
              (let* ((vars (cadr op))
                     (body (substitute-vars (caddr op)
-                                           (if swapped?
-                                               (list (cons (car vars) '(in 1)) (cons (cadr vars) '(in 0)))
-                                               (list (cons (car vars) '(in 0)) (cons (cadr vars) '(in 1)))))))
+                                           (append
+                                            (if swapped?
+                                                (list (cons (car vars) '(in 1)) (cons (cadr vars) '(in 0)))
+                                                (list (cons (car vars) '(in 0)) (cons (cadr vars) '(in 1))))
+                                            (map (lambda (v k) (cons v `(in ,(+ k 2))))
+                                                 (cddr vars) (iota (length (cddr vars))))))))
                (and body (list 'expr body))))
             (else #f))))
 
@@ -686,7 +692,8 @@
   ;;   n:           the form of the scan length.
   (define (scan-statements bodies in-dts odt read out-off n)
     (let* ((value (list-ref bodies 0)) (seed (list-ref bodies 1)) (step (list-ref bodies 2))
-           (neutral (list-ref bodies 3)) (excl? (list-ref bodies 4))
+           (neutral (list-ref bodies 3)) (excl? (list-ref bodies 4)) (aux (list-ref bodies 5))
+           (aux-vars (map (lambda (j) (sym "%x" j)) (iota (length aux))))
            (otype (codegen-dtype-type odt))
            (oref (vector-ref-name odt)) (oset (vector-set-name odt))
            (ov (v-name (length in-dts)))
@@ -694,7 +701,8 @@
       (define (note! f?) (when f? (set! fails? #t)))
       (define (store a)
         (let-values (((form f?) (typed-store-form odt a helper-name))) (note! f?) form))
-      ;; (bindings . atom) of the step combining the pairs acc and v
+      ;; (bindings . atom) of the step combining the pairs acc and v, with
+      ;; the aux values as inputs 2, 3, ...
       (define (combine acc v)
         (if (eq? (car step) 'std)
             (let ((op (cadr step)) (sw? (caddr step)))
@@ -705,19 +713,26 @@
                   (let ((tr (translate-typed-bodies (list (if sw? `(,op (in 1) (in 0)) `(,op (in 0) (in 1))))
                                                     (lambda (k) (if (= k 0) acc v)) helper-name)))
                     (and tr (begin (note! (caddr tr)) (cons (car tr) (car (cadr tr))))))))
-            (let ((tr (translate-typed-bodies (list (cadr step)) (lambda (k) (if (= k 0) acc v)) helper-name)))
+            (let ((tr (translate-typed-bodies (list (cadr step))
+                                              (lambda (k) (cond ((= k 0) acc) ((= k 1) v)
+                                                                (else (cons (list-ref aux-vars (- k 2))
+                                                                            (list-ref atypes (- k 2))))))
+                                              helper-name)))
               (and tr (begin (note! (caddr tr)) (cons (car tr) (car (cadr tr))))))))
       ;; the statement storing at position at the step of acc-form and %v
       (define (step-store acc-form at)
         (let ((c (combine (cons '%a otype) (cons '%v vtype))))
           (and c `(let* ((%a ,acc-form) ,@(car c)) (,oset ,ov ,(out-off at) ,(store (cdr c)))))))
       (define vtype #f)
-      (let ((vtr (translate-typed-bodies (list value) (lambda (k) (cons (read k '%r) (codegen-dtype-type (list-ref in-dts k))))
+      (define atypes '())
+      (let ((vtr (translate-typed-bodies (cons value aux)
+                                         (lambda (k) (cons (read k '%r) (codegen-dtype-type (list-ref in-dts k))))
                                          helper-name)))
         (and vtr
              (begin
                (note! (caddr vtr))
                (set! vtype (cdr (car (cadr vtr))))
+               (set! atypes (map cdr (cdr (cadr vtr))))
                (let* ((seed-read (and seed (read seed 0)))
                       (at        (if excl? '(+ %r 1) '%r))
                       (first     (if seed
@@ -733,7 +748,8 @@
                                            (store (cons seed-read otype))
                                            (store (cons neutral (if (exact-integer? neutral) 'i 'f)))))))
                            '())
-                       `(let* (,@(car vtr) (%v ,(car (car (cadr vtr)))))
+                       `(let* (,@(car vtr) (%v ,(car (car (cadr vtr))))
+                               ,@(map (lambda (x a) (list x (car a))) aux-vars (cdr (cadr vtr))))
                           (if (= %r 0) ,first ,later))
                        (if excl? `(- ,n 1) n)
                        fails?))))))))
@@ -1365,7 +1381,8 @@
                   (excl? (and (scan-result-exclusive? res) #t))
                   (neutral (let ((v (combine-spec-neutral spec)))
                              (and v (round-to-dtype v odt))))
-                  (bodies (list (symbolic-body (scan-result-body res)) seed-k step neutral excl?)))
+                  (bodies (list (symbolic-body (scan-result-body res)) seed-k step neutral excl?
+                                (map symbolic-body (scan-result-aux res)))))
              (and (memq odt codegen-dtypes)
                   (every (lambda (dt) (memq dt codegen-dtypes)) in-dts)
                   (eq? (combine-spec-acc-dtype spec) odt)
