@@ -253,7 +253,8 @@ What it runs:
 - scans over spaces of up to rank 8 that the catalogue scan kernels do not
   run: scans with a combining expression, scans of strided arrays, and
   integer scans. The combining expression may use table ops, `cast` and
-  `if` (see below).
+  `if` (see below), and the elements of the scan's extra (aux) arrays at
+  the same position.
 
 The operands may be f32, f64, s32, s64 or u32, mixed as the body needs.
 A body may contain `(if (rel x y) a b)`, with `rel` one of `<`, `>`, `<=`,
