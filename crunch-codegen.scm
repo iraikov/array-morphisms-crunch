@@ -54,11 +54,12 @@
           (only (chicken process-context posix) current-process-id)
           (only (scheme base) make-parameter exact-integer? vector-append)
           (only (chicken io) read-string)
-          (only (chicken platform) chicken-version)
+          (only (chicken platform) chicken-version repository-path)
           (only (scheme time) current-jiffy jiffies-per-second)
           (only (chicken memory) pointer?)
           (only (chicken sort) sort)
-          (only srfi-1 every any iota filter list-index delete-duplicates)
+          (only srfi-1 every any iota filter list-index delete-duplicates
+                filter-map find append-map)
           (only srfi-69 make-hash-table hash-table-ref/default hash-table-set!)
           datatype
           array-morphisms-core
@@ -152,6 +153,43 @@
   ;; instruction that rounds once.
   (define csc-options
     '("-s" "-O2" "-d1" "-C" "-O3 -DNDEBUG -fno-semantic-interposition -ffp-contract=off"))
+
+  ;; The directory that holds crunch.h, or #f when it cannot be found.
+  ;; chicken-install puts the header in <prefix>/include/chicken, which csc
+  ;; searches, unless CHICKEN_INSTALL_PREFIX is set; then it goes to
+  ;; $CHICKEN_INSTALL_PREFIX/include, which csc does not search.  The
+  ;; directory is read from crunch's egg-info file in the repository, or
+  ;; else taken from the include directories of that prefix.
+  (define (find-crunch-include-directory)
+    (define (egg-info-directories repo)
+      (let ((info (make-pathname repo "crunch" "egg-info")))
+        (if (file-exists? info)
+            (let* ((data (handle-exceptions e #f (call-with-input-file info read)))
+                   (files (cond ((and (pair? data) (assq 'installed-files data)) => cdr)
+                                (else '()))))
+              (filter-map (lambda (f)
+                            (and (string? f)
+                                 (equal? (pathname-strip-directory f) "crunch.h")
+                                 (pathname-directory f)))
+                          files))
+            '())))
+    (let ((prefix (get-environment-variable "CHICKEN_INSTALL_PREFIX")))
+      (find (lambda (d) (file-exists? (make-pathname d "crunch.h")))
+            (append (append-map egg-info-directories (repository-path))
+                    (if prefix
+                        (list (make-pathname prefix "include")
+                              (make-pathname (list prefix "include") "chicken"))
+                        '())))))
+
+  ;; The csc options that add the directory of crunch.h to the C include
+  ;; path, found once per process.
+  (define crunch-include-options
+    (let ((opts 'unknown))
+      (lambda ()
+        (when (eq? opts 'unknown)
+          (set! opts (let ((d (find-crunch-include-directory)))
+                       (if d (list "-C" (string-append "-I" d)) '()))))
+        opts)))
 
   ;; Changed whenever the generated code changes in a way the source text
   ;; alone does not show.
@@ -1000,7 +1038,9 @@
             (write-file src source)
             (let* ((cmd (string-append
                          (shell-quote (crunch-codegen-csc)) " "
-                         (string-intersperse (map shell-quote csc-options) " ")
+                         (string-intersperse (map shell-quote (append csc-options
+                                                                       (crunch-include-options)))
+                                             " ")
                          " -I " (shell-quote dir) " " (shell-quote src)
                          " -o " (shell-quote tmp) " > " (shell-quote log) " 2>&1"))
                    (status (handle-exceptions e 1 (system cmd))))
