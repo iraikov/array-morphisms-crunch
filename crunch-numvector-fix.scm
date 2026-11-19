@@ -1,16 +1,26 @@
 ;;; crunch-numvector-fix.scm
 ;;;
-;;; Scheme-to-crunch numeric-vector converters for crunch's
-;;; embedded mode.  Include this file before the first (crunch ...) form of
-;;; any module that passes SRFI-4 vectors into crunch-compiled procedures.
+;;; Allows crunch-compiled procedures take SRFI-4 numeric vectors
+;;; (s32vector, s64vector, f32vector, f64vector) as arguments.
 ;;;
-;;; crunch's embedded foreign wrappers convert each numeric-vector argument
-;;; with crunch_scheme_<t>vector() from crunch.h.  Under CHICKEN 6 a SRFI-4
-;;; vector is a two-slot structure (type tag, bytevector), so the converter
-;;; has to follow slot 1 to reach the element storage; it must also allocate
-;;; a whole block descriptor and give it a reference count of one, so that
-;;; the wrapper's closing crunch_unref() releases the descriptor (and never
-;;; the element storage, which remains owned by the Scheme heap).
+;;; Usage: include this file in a module before its first (crunch ...)
+;;; form.  It does two things:
+;;;
+;;; 1. It replaces the converters that crunch.h provides for these four
+;;;    vector types.  When a Scheme procedure calls a crunch procedure,
+;;;    the generated wrapper calls crunch_scheme_<t>vector() on each
+;;;    vector argument.  That converter builds a small C descriptor (a
+;;;    block holding the length, size, flags and a pointer to the elements).
+;;;    The replacements here build the descriptor so that:
+;;;    - the data pointer is correct.  In CHICKEN 6 a SRFI-4 vector is a
+;;;      record of two slots, a type tag and a bytevector, and the elements
+;;;      are in the bytevector of slot 1;
+;;;    - the reference count starts at one.  After the call, the wrapper
+;;;      calls crunch_unref(), which frees the descriptor.  It never frees
+;;;      the elements, which stay in the Scheme heap.
+;;;
+;;; 2. It can compile the module for the CPU of the build machine; see
+;;;    the section on host-specific code generation below.
 
 (foreign-declare #<<EOC
 #define CRUNCH_EMBEDDED

@@ -304,6 +304,8 @@
      crunch-conv-bwd-weights-im2col-f32
      crunch-conv-fwd-nhwc-im2col-f32
      crunch-conv-bwd-data-nhwc-im2col-f32
-     crunch-conv-bwd-weights-nhwc-im2col-f32))
+     crunch-conv-bwd-weights-nhwc-im2col-f32
+     crunch-dgemm-offset   crunch-sgemm-offset    ; gemm-offset-f64   gemm-offset-f32
+     crunch-ddot-offset    crunch-sdot-offset))   ; dot-offset-f64    dot-offset-f32
 
 ) ;; end module array-morphisms-crunch-conv-backend

@@ -9,7 +9,11 @@
 
  ; crunch is CHICKEN 6's embedded compiler for a statically typed subset of
  ; Scheme.  Its (crunch ...) macro generates C during normal compilation of
- ; each .scm file, so this egg has no separate C sources.
+ ; each .scm file.  The only separate C source is the thread pool header
+ ; crunch-thread-pool.h, included by crunch-thread-dispatch.scm.
+ ; crunch installs crunch.h where csc may not look for it when
+ ; CHICKEN_INSTALL_PREFIX is set; crunch-include.scm finds it and adds
+ ; its directory to the C compiler's include path.
  (dependencies crunch array-morphisms)
 
  (author "Ivan Raikov")
@@ -18,28 +22,42 @@
 
  (components (extension array-morphisms-crunch-threads
                         (source "crunch-thread-dispatch.scm")
-                        (csc-options "-O2" "-d1" "-C" "-O3 -DNDEBUG")
+                        (source-dependencies "crunch-thread-pool.h" "crunch-dispatch-n.h")
+                        (csc-options (custom-config "crunch-include.scm") "-O2" "-d1" "-C" "-O3 -DNDEBUG")
                         (link-options "-L" "-lpthread"))
+             (extension array-morphisms-crunch-translate
+                        (source "crunch-translate.scm")
+                        (csc-options (custom-config "crunch-include.scm")))
              (extension array-morphisms-crunch-activations
                         (source "crunch-activation-kernels.scm")
                         (source-dependencies "crunch-numvector-fix.scm")
-                        (csc-options "-O2" "-d1" "-C" "-O3 -DNDEBUG")
+                        (csc-options (custom-config "crunch-include.scm") "-O2" "-d1" "-C" "-O3 -DNDEBUG -fno-semantic-interposition")
                         (link-options "-L" "-lpthread")
-                        (component-dependencies array-morphisms-crunch-threads))
+                        (component-dependencies array-morphisms-crunch-threads
+                                                array-morphisms-crunch-translate))
+             ;; The GEMM kernels' functions and loops are aligned to 64 bytes,
+             ;; so that their speed does not depend on where the code before
+             ;; them in the file happens to end.
              (extension array-morphisms-crunch-blas-backend
                         (source "crunch-blas-backend.scm")
                         (source-dependencies "crunch-numvector-fix.scm")
-                        (csc-options "-O2" "-d1" "-C" "-O3 -DNDEBUG")
+                        (csc-options (custom-config "crunch-include.scm") "-O2" "-d1" "-C" "-O3 -DNDEBUG -falign-functions=64 -falign-loops=64")
                         (component-dependencies array-morphisms-crunch-threads))
              (extension array-morphisms-crunch-optimizers
                         (source "crunch-optimizer-kernels.scm")
                         (source-dependencies "crunch-numvector-fix.scm")
-                        (csc-options "-O2" "-d1" "-C" "-O3 -DNDEBUG")
+                        (csc-options (custom-config "crunch-include.scm") "-O2" "-d1" "-C" "-O3 -DNDEBUG")
                         (component-dependencies array-morphisms-crunch-threads))
+             (extension array-morphisms-crunch-codegen
+                        (source "crunch-codegen.scm")
+                        (csc-options (custom-config "crunch-include.scm"))
+                        (source-dependencies "crunch-numvector-fix.scm" "crunch-dispatch-n.h")
+                        (component-dependencies array-morphisms-crunch-threads
+                                                array-morphisms-crunch-translate))
              (extension array-morphisms-crunch-conv-backend
                         (source "crunch-conv-backend.scm")
                         (source-dependencies "crunch-numvector-fix.scm")
-                        (csc-options "-O2" "-d1" "-C" "-O3 -DNDEBUG")
+                        (csc-options (custom-config "crunch-include.scm") "-O2" "-d1" "-C" "-O3 -DNDEBUG")
                         (component-dependencies array-morphisms-crunch-blas-backend))
              )
 

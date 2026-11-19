@@ -236,6 +236,21 @@
   (test-assert "gemm-strided-f64 large transposed case (M=64 N=33 K=70, T/T, pad 2)"
     (strided-case crunch-dgemm-strided make-f64 1e-12 64 33 70 'trans 'trans 2 1.0 0.0))
 
+  ;; Packing buffers are reused from call to call: a sequence of products
+  ;; whose packed operands grow, shrink and grow again must each come out
+  ;; right, whichever free buffer it receives.
+  (test-assert "gemm-strided: products of changing sizes reuse packing buffers correctly"
+    (let loop ((sizes '((3 4 5) (40 30 50) (2 3 2) (17 9 33) (40 30 50) (1 1 1) (64 33 70)))
+               (ok #t))
+      (if (null? sizes)
+          ok
+          (let ((M (car (car sizes))) (N (cadr (car sizes))) (K (caddr (car sizes))))
+            (loop (cdr sizes)
+                  (and ok
+                       (strided-case crunch-sgemm-strided make-f32 1e-5 M N K 'trans 'trans 1 1.0 0.0)
+                       (strided-case crunch-dgemm-strided make-f64 1e-12 M N K 'trans 'no-trans 0 0.7 0.2)
+                       (strided-case crunch-sgemm-strided make-f32 1e-5 M N K 'no-trans 'trans 2 1.0 0.5)))))))
+
   (test-assert "gemm-strided with default lda equals plain gemm"
     (let ((A (make-f32 (* 6 4) gen-a)) (B (make-f32 (* 4 5) gen-b))
           (C1 (make-f32 30 gen-c)) (C2 (make-f32 30 gen-c)))
@@ -493,5 +508,100 @@
    ;; multiple of eight, single rows and columns, and products large
    ;; enough to be split among threads.
    '((1 1 1) (1 40 3) (40 1 3) (7 5 9) (33 17 12) (300 64 70) (1000 24 40) (37 129 256))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Offset GEMM kernels
+;;;
+;;; A product of matrices stored from element offsets into longer vectors
+;;; must equal, bit for bit, the strided kernel's product of the same
+;;; matrices stored from element 0.
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (offset-gemm-agrees? backend dt M N K ta tb off-a off-b off-c beta)
+  (let* ((f64?   (eq? dt 'f64))
+         (make   (if f64? make-f64vector make-f32vector))
+         (vref   (if f64? f64vector-ref f32vector-ref))
+         (vset!  (if f64? f64vector-set! f32vector-set!))
+         (strided (if f64? (blas-backend-gemm-strided-f64 backend)
+                      (blas-backend-gemm-strided-f32 backend)))
+         (offset  (if f64? (blas-backend-gemm-offset-f64 backend)
+                      (blas-backend-gemm-offset-f32 backend)))
+         (lda    (if (eq? ta 'trans) M K))
+         (ldb    (if (eq? tb 'trans) K N))
+         (na     (* M K))
+         (nb     (* K N))
+         (nc     (* M N))
+         (fill   (lambda (v n off seed)
+                   (do ((i 0 (+ i 1))) ((= i n) v)
+                     (vset! v (+ off i) (sin (+ seed (* 0.37 i)))))))
+         (a0 (fill (make na) na 0 0.1))
+         (b0 (fill (make nb) nb 0 0.7))
+         (c0 (fill (make nc) nc 0 1.3))
+         (a1 (fill (make (+ off-a na 3)) na off-a 0.1))
+         (b1 (fill (make (+ off-b nb 3)) nb off-b 0.7))
+         (c1 (fill (make (+ off-c nc 3)) nc off-c 1.3)))
+    (strided M N K 1.0 a0 lda ta b0 ldb tb beta c0)
+    (offset M N K 1.0 a1 off-a lda ta b1 off-b ldb tb beta c1 off-c)
+    (let loop ((i 0))
+      (or (= i nc)
+          (and (eqv? (vref c0 i) (vref c1 (+ off-c i))) (loop (+ i 1)))))))
+
+(define (offset-gemm-tests backend label)
+  (for-each
+   (lambda (dt)
+     (for-each
+      (lambda (mnk)
+        (for-each
+         (lambda (ts)
+           (let ((M (car mnk)) (N (cadr mnk)) (K (caddr mnk)))
+             (test-assert (string-append label " " (symbol->string dt) " "
+                                         (number->string M) "x" (number->string N) "x"
+                                         (number->string K) " " (symbol->string (car ts))
+                                         " " (symbol->string (cadr ts)))
+               (and (offset-gemm-agrees? backend dt M N K (car ts) (cadr ts) 5 11 7 0.0)
+                    (offset-gemm-agrees? backend dt M N K (car ts) (cadr ts) 0 0 0 0.0)
+                    (offset-gemm-agrees? backend dt M N K (car ts) (cadr ts) 13 1 29 0.5)))))
+         '((no-trans no-trans) (trans no-trans) (no-trans trans) (trans trans))))
+      '((1 1 1) (7 5 9) (33 17 12) (64 70 48))))
+   '(f32 f64)))
+
+(test-group "crunch BLAS - offset GEMM kernels"
+  (for-each
+   (lambda (threads)
+     (parameterize ((crunch-thread-count threads))
+       (offset-gemm-tests (make-crunch-blas-backend)
+                          (sprintf "threads ~A:" threads))))
+   '(1 4)))
+
+;; The offset DOT kernel on vectors stored from offsets equals, bit for
+;; bit, the DOT kernel on the same vectors stored from element 0.
+(define (offset-dot-agrees? backend dt N off-x off-y)
+  (let* ((f64?  (eq? dt 'f64))
+         (make  (if f64? make-f64vector make-f32vector))
+         (vset! (if f64? f64vector-set! f32vector-set!))
+         (dot   (if f64? (blas-backend-dot-f64 backend) (blas-backend-dot-f32 backend)))
+         (doto  (if f64? (blas-backend-dot-offset-f64 backend)
+                    (blas-backend-dot-offset-f32 backend)))
+         (fill  (lambda (v off seed)
+                  (do ((i 0 (+ i 1))) ((= i N) v)
+                    (vset! v (+ off i) (sin (+ seed (* 0.37 i))))))))
+    (eqv? (dot N (fill (make N) 0 0.1) (fill (make N) 0 0.7))
+          (doto N (fill (make (+ off-x N 2)) off-x 0.1) off-x
+                (fill (make (+ off-y N 2)) off-y 0.7) off-y))))
+
+(define (offset-dot-tests backend label)
+  (for-each
+   (lambda (dt)
+     (for-each
+      (lambda (N)
+        (test-assert (string-append label " " (symbol->string dt) " N=" (number->string N))
+          (and (offset-dot-agrees? backend dt N 0 0)
+               (offset-dot-agrees? backend dt N 3 0)
+               (offset-dot-agrees? backend dt N 1 17))))
+      '(1 7 64 1000 4099)))
+   '(f32 f64)))
+
+(test-group "crunch BLAS - offset DOT kernels"
+  (offset-dot-tests (make-crunch-blas-backend) "offset dot"))
 
 (test-exit)

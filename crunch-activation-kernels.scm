@@ -1,28 +1,28 @@
 ;;; crunch-activation-kernels.scm
+;;;
 ;;; Whole-array activation kernels compiled to C by crunch, packaged as an
 ;;; activation backend for array-morphisms (see activation-exec.scm in the
 ;;; array-morphisms egg).
 ;;;
-;;; Each activation op is one table entry (op (v) expr): expr computes the
-;;; op's value from one input element v.  The define-crunch-activations
-;;; macro turns every entry into an f32 and an f64 kernel, each a crunch
-;;; procedure (kernel n in out) that stores expr for the first n elements of
-;;; in into out.  crunch computes in double precision throughout, so the f32
-;;; kernels read single floats, compute in double and round on store, which
-;;; is exactly what the Scheme fallback does.
+;;; The formula of each activation op is taken, at syntax time, from
+;;; the scalar-op table of array-morphisms (module
+;;; array-morphisms-scalar-ops-table), whose entries (op (v) expr ...)
+;;; give expr computing the op's value from one input element v.  The
+;;; define-crunch-activations macro turns the entry of every op it is
+;;; given into an f32 and an f64 kernel, each a crunch procedure
+;;; (kernel n in out) that stores expr for the first n elements of in
+;;; into out.  crunch computes in double precision throughout, so the
+;;; f32 kernels read single floats, compute in double and round on
+;;; store, which is exactly what the Scheme fallback does.
 ;;;
-;;; The formulas below are those of basic-ops.scm (relu, sigmoid, tanh, and
-;;; the unary math ops exp, log, sqrt, negate and abs) and
-;;; of the derivative maps emitted by ssa-vjp (relu-deriv, sigmoid-deriv,
-;;; tanh-deriv), written the same way, so that each kernel gives the same
-;;; floating-point result as the combiner it replaces.  relu is written as a
-;;; comparison rather than max: (if (> v 0.0) v 0.0) gives 0.0 for NaN and
-;;; -0.0, as CHICKEN's (max 0.0 v) does.  negate is written as (* -1.0 x),
-;;; which gives -0.0 for 0.0 as (- x) does.  log and sqrt of a negative
-;;; number give NaN, where the Scheme combiners return a complex number.  tanh is computed from
-;;; e = exp(-2|x|), which cannot overflow, so large |x| gives +-1.0.
-;;; Entries must use fpabs rather than abs: crunch 0.992 compiles abs on a
-;;; float to C's integer abs(), which truncates its argument.
+;;; The same table supplies the Scheme combiners of array-morphisms, so each
+;;; kernel computes the same formula as the combiner it replaces: relu,
+;;; sigmoid and tanh, the unary math ops exp, log, sqrt, negate and abs, and
+;;; the derivative maps emitted by ssa-vjp (relu-deriv, sigmoid-deriv,
+;;; tanh-deriv).  log and sqrt of a negative number give NaN, where the
+;;; Scheme combiners return a complex number.  The table writes fpabs rather
+;;; than abs because crunch 0.992 compiles abs on a float to C's integer
+;;; abs(), which truncates its argument.
 ;;;
 ;;; The derivative entries are separate ops because ssa-vjp emits each
 ;;; derivative as its own unary binding and chooses its input: relu-deriv
@@ -43,7 +43,9 @@
 ;;; a fixed slope must appear as a literal, and each distinct value needs an
 ;;; entry of its own.
 ;;;
-;;; Adding an entry supplies only a fast kernel.  An op still needs a
+;;; Adding an op name to the define-crunch-activations form supplies only a
+;;; fast kernel; the op must already have an entry of one parameter in the
+;;; scalar-op table.  An op still needs a
 ;;; morph-<op> constructor, an ssa-vjp rule and a rebuild-morphism case in
 ;;; array-morphisms before SSA training graphs can contain it, and its name
 ;;; must be registered with register-activation-op! (done here for every
@@ -56,6 +58,19 @@
 ;;;
 ;;;   (register-activation-backend! (make-crunch-threaded-activation-backend))
 ;;;
+;;; Fused kernels
+;;;
+;;; The backends also hold fused kernels: each computes a whole segop body
+;;; that combines several table ops, such as g * relu-deriv(x), in one
+;;; pass over its inputs (see define-crunch-fused below).  The fusion pass
+;;; of array-morphisms fuses bindings into such a body only when the
+;;; active backend holds a kernel for it.  A body is written in segop
+;;; syntax, in the canonical form of canonical-scalar-body, with
+;;; (cast f32 e) where the unfused program would store an intermediate f32
+;;; value; the f32 kernel rounds there, and the f64 kernel, whose body has
+;;; no casts, does not round.  So each kernel computes exactly what the
+;;; separate bindings compute.
+;;;
 ;;; The module also exports two kernels with no morphism op, called
 ;;; directly on preallocated vectors: crunch-softmax-rows-<t>, a row-wise
 ;;; softmax, and crunch-rope-<t>, the interleaved rotary position
@@ -67,6 +82,8 @@
    make-crunch-threaded-activation-backend
    crunch-activation-ops
    crunch-activation-chunk-kernel
+   crunch-fused-bodies
+   crunch-colsum-bodies
 
    ;; Raw kernels: (kernel n in out) -> void, no argument checking.
    crunch-relu-f32          crunch-relu-f64
@@ -86,10 +103,12 @@
    crunch-rope-f32          crunch-rope-f64)
 
   (import scheme (chicken base) (chicken foreign) (chicken flonum)
-          (chicken number-vector) crunch)
+          (chicken number-vector) crunch (crunch c))
   (import array-morphisms-activation-exec)
+  (import (only array-morphisms-segop canonical-scalar-body))
   (import array-morphisms-crunch-threads)
-  (import-for-syntax scheme (chicken base))
+  (import-for-syntax scheme (chicken base) array-morphisms-scalar-ops-table
+                     array-morphisms-crunch-translate)
 
   (include "crunch-numvector-fix.scm")
 
@@ -97,9 +116,10 @@
   ;;; Kernel generation
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-  ;; (define-crunch-activations (op (v) expr) ...)
+  ;; (define-crunch-activations op ...)
   ;;
-  ;; For each entry defines crunch-<op>-f32 and crunch-<op>-f64 and the chunk
+  ;; For each op, whose entry (op (v) expr ...) is looked up in the
+  ;; scalar-op table, defines crunch-<op>-f32 and crunch-<op>-f64 and the chunk
   ;; kernels am_crunch_<op>_chunk_f32 and am_crunch_<op>_chunk_f64, and binds
   ;; %crunch-activation-table to a list of
   ;;   (op f32-kernel f64-kernel f32-chunk-address f64-chunk-address).
@@ -142,15 +162,17 @@
                (do ((i 0 (+ i 1))) ((= i n))
                  (let ((,v (,ref in i)))
                    (,set out i ,expr)))))))
-       (let ((entries (cdr form)))
-         (for-each
-          (lambda (e)
-            (unless (and (list? e) (= (length e) 3) (symbol? (car e))
-                         (list? (cadr e)) (= (length (cadr e)) 1)
-                         (symbol? (car (cadr e))))
-              (error 'define-crunch-activations
-                     "entry must have the form (op (v) expr)" e)))
-          entries)
+       (let ((entries
+              (map (lambda (op)
+                     (let ((e (assq op scalar-ops-table)))
+                       (unless e
+                         (error 'define-crunch-activations "no scalar-op table entry for" op))
+                       (unless (and (list? (cadr e)) (= (length (cadr e)) 1)
+                                    (symbol? (car (cadr e))))
+                         (error 'define-crunch-activations
+                                "the table entry must have one parameter" e))
+                       (list (car e) (cadr e) (branch-free-indicators (caddr e)))))
+                   (cdr form))))
          `(,(r 'begin)
            ,@(apply append
                     (map (lambda (e)
@@ -171,19 +193,8 @@
                     entries))))))))
 
   (define-crunch-activations
-    (relu          (x) (if (> x 0.0) x 0.0))
-    (sigmoid       (x) (/ 1.0 (+ 1.0 (exp (- x)))))
-    (tanh          (x) (let* ((e (exp (* -2.0 (fpabs x))))
-                                  (t (/ (- 1.0 e) (+ 1.0 e))))
-                             (if (< x 0.0) (- t) t)))
-    (relu-deriv    (x) (if (> x 0.0) 1.0 0.0))
-    (sigmoid-deriv (s) (* s (- 1.0 s)))
-    (tanh-deriv    (t) (- 1.0 (* t t)))
-    (exp           (x) (exp x))
-    (log           (x) (log x))
-    (sqrt          (x) (sqrt x))
-    (negate        (x) (* -1.0 x))
-    (abs           (x) (fpabs x)))
+    relu sigmoid tanh relu-deriv sigmoid-deriv tanh-deriv
+    exp log sqrt negate abs)
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Row softmax
@@ -711,6 +722,143 @@
      (list 'min 1 %k-min-axis1-f32 %k-min-axis1-f64)))
 
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; Scan kernels
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  ;; %k-scan-<op>-<order>-<t> scans the row-major outer x n x inner array src
+  ;; along its middle axis into out, as execute-scan-morphism in
+  ;; array-morphisms does.  flags (below 8) holds 1 for an exclusive scan,
+  ;; 2 for a reversed one and 4 when seed, a row-major outer x inner array,
+  ;; holds the values the lines start from.  order is acc when each step
+  ;; is (op acc x) and elt when it is (op x acc).  The kernel walks the
+  ;; positions of the axis in the scan's order and, at each, the inner
+  ;; elements, whose lines are independent:
+  ;;   * an inclusive scan stores at the first position x (or seed op x),
+  ;;     and at every later one the stored value of the position before
+  ;;     combined with x;
+  ;;   * an exclusive scan stores at the first position seed (or the
+  ;;     neutral element), at the second x of the first position (or seed
+  ;;     op it), and at every later one the stored value of the position
+  ;;     before combined with x of the position before.
+  ;; Every value is stored before it is used again, so f32 scans round at
+  ;; every step; max and min replace the value so far only when the
+  ;; comparison holds, so a NaN element is passed over.  When inner is 1
+  ;; (a scan along the last axis) each line is contiguous; the kernel then
+  ;; scans eight lines together, one position of each at a time, so that
+  ;; the steps of different lines, which do not wait for each other,
+  ;; overlap.
+  ;;
+  ;; (define-crunch-scans (op neutral (a x) step) ...) defines the kernels
+  ;; of each op, step being the expression of a and x, and binds
+  ;; %crunch-scan-table to a list of
+  ;;   (op f32-acc-kernel f64-acc-kernel f32-elt-kernel f64-elt-kernel).
+  (define-syntax define-crunch-scans
+    (er-macro-transformer
+     (lambda (form r c)
+       (define (name op order dtype)
+         (string->symbol (string-append "%k-scan-" (symbol->string op) "-" (symbol->string order)
+                                        "-" (symbol->string dtype))))
+       (define (kernel op neutral a x step order dtype)
+         (let* ((vec (if (eq? dtype 'f32) 'f32vector 'f64vector))
+                (ref (if (eq? dtype 'f32) 'f32vector-ref 'f64vector-ref))
+                (set (if (eq? dtype 'f32) 'f32vector-set! 'f64vector-set!))
+                (k   (name op order dtype))
+                ;; the step combining acc-form with x-form
+                (comb (lambda (acc-form x-form)
+                        (if (eq? order 'acc)
+                            `(let ((,a ,acc-form) (,x ,x-form)) ,step)
+                            `(let ((,a ,x-form) (,x ,acc-form)) ,step))))
+                (row (lambda (value) `(do ((i 0 (+ i 1))) ((= i inner)) (,set out (+ b i) ,value))))
+                ;; the lines o + t for t in ts, contiguous, scanned together
+                ;; from index f_t in direction dir
+                (lines
+                 (lambda (ts)
+                   (let* ((fv (lambda (t) (string->symbol (string-append "f" (number->string t)))))
+                          (iv (lambda (t) (string->symbol (string-append "i" (number->string t)))))
+                          (each (lambda (form-of) (map form-of ts))))
+                     `(let* ((dir (if (= rev 1) -1 1))
+                             ,@(each (lambda (t) `(,(fv t) (let ((base (* (+ o ,t) n)))
+                                                              (if (= rev 1) (+ base (- n 1)) base))))))
+                        (if (= excl 0)
+                            (begin
+                              (if (= hs 1)
+                                  (begin ,@(each (lambda (t) `(,set out ,(fv t) ,(comb `(,ref seed (+ o ,t)) `(,ref src ,(fv t)))))))
+                                  (begin ,@(each (lambda (t) `(,set out ,(fv t) (,ref src ,(fv t)))))))
+                              (do ((r 1 (+ r 1))) ((>= r n))
+                                (let* ,(each (lambda (t) `(,(iv t) (+ ,(fv t) (* r dir)))))
+                                  ,@(each (lambda (t) `(,set out ,(iv t) ,(comb `(,ref out (- ,(iv t) dir)) `(,ref src ,(iv t)))))))))
+                            (begin
+                              (if (= hs 1)
+                                  (begin ,@(each (lambda (t) `(,set out ,(fv t) (,ref seed (+ o ,t))))))
+                                  (begin ,@(each (lambda (t) `(,set out ,(fv t) ,neutral)))))
+                              (if (> n 1)
+                                  (begin
+                                    (if (= hs 1)
+                                        (begin ,@(each (lambda (t) `(,set out (+ ,(fv t) dir) ,(comb `(,ref seed (+ o ,t)) `(,ref src ,(fv t)))))))
+                                        (begin ,@(each (lambda (t) `(,set out (+ ,(fv t) dir) (,ref src ,(fv t)))))))
+                                    (do ((r 2 (+ r 1))) ((>= r n))
+                                      (let* ,(each (lambda (t) `(,(iv t) (+ ,(fv t) (* r dir)))))
+                                        ,@(each (lambda (t) `(,set out ,(iv t) ,(comb `(,ref out (- ,(iv t) dir)) `(,ref src (- ,(iv t) dir)))))))))))))))))
+           `(,(r 'crunch)
+             (: (,k integer integer integer ,vec ,vec ,vec integer) void)
+             (define (,k outer n inner src seed out flags)
+               (let ((excl (remainder flags 2))
+                     (rev  (remainder (quotient flags 2) 2))
+                     (hs   (remainder (quotient flags 4) 2)))
+                 (if (= inner 1)
+                     (if (> n 0)
+                         (let ((full (* 8 (quotient outer 8))))
+                           (do ((o 0 (+ o 8))) ((>= o full))
+                             ,(lines '(0 1 2 3 4 5 6 7)))
+                           (do ((o full (+ o 1))) ((>= o outer))
+                             ,(lines '(0)))))
+                 (do ((o 0 (+ o 1))) ((= o outer))
+                   (do ((r 0 (+ r 1))) ((= r n))
+                     (let* ((pos (if (= rev 1) (- (- n 1) r) r))
+                            (prev (if (= rev 1) (+ pos 1) (- pos 1)))
+                            (b  (* (+ (* o n) pos) inner))
+                            (pb (* (+ (* o n) prev) inner))
+                            (sb (* o inner)))
+                       (if (= excl 0)
+                           (if (= r 0)
+                               (if (= hs 1)
+                                   ,(row (comb `(,ref seed (+ sb i)) `(,ref src (+ b i))))
+                                   ,(row `(,ref src (+ b i))))
+                               ,(row (comb `(,ref out (+ pb i)) `(,ref src (+ b i)))))
+                           (if (= r 0)
+                               (if (= hs 1)
+                                   ,(row `(,ref seed (+ sb i)))
+                                   ,(row neutral))
+                               (if (= r 1)
+                                   (if (= hs 1)
+                                       ,(row (comb `(,ref seed (+ sb i)) `(,ref src (+ pb i))))
+                                       ,(row `(,ref src (+ pb i))))
+                                   ,(row (comb `(,ref out (+ pb i)) `(,ref src (+ pb i))))))))))))))))
+       (let ((entries (cdr form)))
+         `(,(r 'begin)
+           ,@(apply append
+                    (map (lambda (e)
+                           (let ((op (car e)) (neutral (cadr e))
+                                 (a (car (caddr e))) (x (cadr (caddr e))) (step (cadddr e)))
+                             (map (lambda (od) (kernel op neutral a x step (car od) (cadr od)))
+                                  '((acc f32) (acc f64) (elt f32) (elt f64)))))
+                         entries))
+           (,(r 'define) %crunch-scan-table
+            (,(r 'list)
+             ,@(map (lambda (e)
+                      (let ((op (car e)))
+                        `(,(r 'list) (,(r 'quote) ,op)
+                                     ,(name op 'acc 'f32) ,(name op 'acc 'f64)
+                                     ,(name op 'elt 'f32) ,(name op 'elt 'f64))))
+                    entries))))))))
+
+  (define-crunch-scans
+    (sum  0.0    (a x) (+ a x))
+    (prod 1.0    (a x) (* a x))
+    (max  -inf.0 (a x) (if (> x a) x a))
+    (min  +inf.0 (a x) (if (< x a) x a)))
+
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
   ;;; Strided copy kernels
   ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -763,6 +911,201 @@
   ;; Adds the binary, reduction and strided-copy kernels to be and
   ;; registers the binary op names.  Binary kernels run on up to
   ;; (threads) threads, with at least (min-chunk) elements each.
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+  ;;; Fused kernels
+  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+  ;; (define-crunch-fused body ... (colsum body ...))
+  ;;
+  ;; For each body, a segop body over one to three inputs written for f32
+  ;; (see the module comment), defines an f32 and an f64 chunk kernel in
+  ;; the calling convention of crunch-dispatch4-f32/-f64: v0 ... v(n-1) are
+  ;; the inputs, vn the output, and the remaining vectors and i0-i2 and
+  ;; scal are unused.  The bodies are translated by translate-fused-body
+  ;; (crunch-translate.scm): table ops are expanded from their entries in
+  ;; the scalar-op table, (in k) reads element i of input k, and
+  ;; (cast f32 e) rounds e to single precision with a C conversion.  Binds
+  ;; %crunch-fused-table to a list of
+  ;;   (f32-body f64-body n-inputs f32-chunk-address f64-chunk-address).
+  ;;
+  ;; For each body of the optional last clause (colsum body ...), defines
+  ;; an f32 and an f64 column-sum kernel (rows cols v0 v1 v2 mo out).  It
+  ;; stores the body's value at each element of the rows x cols inputs in
+  ;; mo, and sums each column into out, adding the rows in order as the
+  ;; axis-0 sum kernels do.  Inputs beyond the body's are unused.  Binds
+  ;; %crunch-colsum-table to a list of
+  ;;   (f32-body f64-body n-inputs f32-kernel f64-kernel).
+  (define-syntax define-crunch-fused
+    (er-macro-transformer
+     (lambda (form r c)
+       (define (vec k) (string->symbol (string-append "%v" (number->string k))))
+       (define (translate e dtype)
+         (let ((ref (if (eq? dtype 'f32) 'f32vector-ref 'f64vector-ref)))
+           (translate-fused-body e dtype (lambda (k) `(,ref ,(vec k) %i)) 'define-crunch-fused)))
+       (define (kernel-name k dtype)
+         (string->symbol (string-append "am_crunch_fused_" (number->string k) "_"
+                                        (symbol->string dtype))))
+       (define (kernel-def k body n dtype)
+         (let ((vt  (if (eq? dtype 'f32) 'f32vector 'f64vector))
+               (set (if (eq? dtype 'f32) 'f32vector-set! 'f64vector-set!)))
+           `((: (,(kernel-name k dtype) integer integer integer integer integer
+                 f64vector ,vt ,vt ,vt ,vt) void)
+             (define (,(kernel-name k dtype) start end i0 i1 i2 scal %v0 %v1 %v2 %v3)
+               (do ((%i start (+ %i 1))) ((= %i end))
+                 (,set ,(vec n) %i ,(translate body dtype)))))))
+       (define (address k dtype)
+         `(,(r 'foreign-value)
+           ,(string-append "((void *)&" (symbol->string (kernel-name k dtype)) ")")
+           ,(r 'c-pointer)))
+       (define (colsum-name k dtype)
+         (string->symbol (string-append "am_crunch_colsum_" (number->string k) "_"
+                                        (symbol->string dtype))))
+       (define (colsum-def k body dtype)
+         (let ((vt  (if (eq? dtype 'f32) 'f32vector 'f64vector))
+               (ref (if (eq? dtype 'f32) 'f32vector-ref 'f64vector-ref))
+               (set (if (eq? dtype 'f32) 'f32vector-set! 'f64vector-set!)))
+           `((: (,(colsum-name k dtype) integer integer ,vt ,vt ,vt ,vt ,vt) void)
+             (define (,(colsum-name k dtype) rows cols %v0 %v1 %v2 %mo %out)
+               (do ((n 0 (+ n 1))) ((= n cols))
+                 (,set %out n 0.0))
+               (do ((m 0 (+ m 1))) ((= m rows))
+                 (let ((base (* m cols)))
+                   (do ((n 0 (+ n 1))) ((= n cols))
+                     (let ((%i (+ base n)))
+                       (,set %mo %i ,(translate body dtype))
+                       (,set %out n (+ (,ref %out n) (,ref %mo %i)))))))))))
+       (define (arity b)
+         (let ((n (+ 1 (body-max-input b))))
+           (unless (<= 1 n 3)
+             (error 'define-crunch-fused "a body must have one to three inputs" b))
+           n))
+       (define (indices xs) (let loop ((i 0) (bs xs)) (if (null? bs) '() (cons i (loop (+ i 1) (cdr bs))))))
+       (let* ((last    (and (pair? (cdr form)) (car (reverse (cdr form)))))
+              (colsum? (and (pair? last) (eq? (car last) 'colsum)))
+              (bodies  (if colsum? (reverse (cdr (reverse (cdr form)))) (cdr form)))
+              (cbodies (if colsum? (cdr last) '()))
+              (ks      (indices bodies))
+              (cks     (indices cbodies))
+              (ns      (map arity bodies))
+              (cns     (map arity cbodies)))
+         `(,(r 'begin)
+           ;; The f32 kernels round through a C conversion.  The egg compiles
+           ;; this module with -fno-semantic-interposition so that the C
+           ;; compiler may inline the conversion into each kernel loop.
+           (,(r 'crunch)
+            (define am-crunch-round-f32 (c-lambda ((float x)) float "return (double)(float)x;"))
+            ,@(apply append (map (lambda (k b n) (kernel-def k b n 'f32)) ks bodies ns))
+            ,@(apply append (map (lambda (k b) (colsum-def k b 'f32)) cks cbodies)))
+           (,(r 'crunch)
+            ,@(apply append (map (lambda (k b n) (kernel-def k (strip-casts b) n 'f64)) ks bodies ns))
+            ,@(apply append (map (lambda (k b) (colsum-def k (strip-casts b) 'f64)) cks cbodies)))
+           (,(r 'define) %crunch-fused-table
+            (,(r 'list)
+             ,@(map (lambda (k b n)
+                      `(,(r 'list) (,(r 'quote) ,b) (,(r 'quote) ,(strip-casts b)) ,n
+                                   ,(address k 'f32) ,(address k 'f64)))
+                    ks bodies ns)))
+           (,(r 'define) %crunch-colsum-table
+            (,(r 'list)
+             ,@(map (lambda (k b n)
+                      `(,(r 'list) (,(r 'quote) ,b) (,(r 'quote) ,(strip-casts b)) ,n
+                                   ,(colsum-name k 'f32) ,(colsum-name k 'f64)))
+                    cks cbodies cns))))))))
+
+  ;; The fused bodies, chosen from the bodies the fusion pass forms in the
+  ;; backward passes of convolutional, dense and transformer models:
+  ;; derivatives of the activations times the incoming gradient, x*y + z,
+  ;; the negated product, and exp(-x); and, from the forward pass of
+  ;; Llama's feed-forward block, silu(a) = a * sigmoid(a) and b * silu(a).
+  ;; silu is listed because the pass forms b * silu(a) from it.
+  (define-crunch-fused
+    (mul (in 0) (cast f32 (relu-deriv (in 1))))
+    (mul (in 0) (cast f32 (sigmoid-deriv (in 1))))
+    (mul (in 0) (cast f32 (tanh-deriv (in 1))))
+    (add (in 0) (cast f32 (mul (in 1) (in 2))))
+    (negate (cast f32 (mul (in 0) (in 1))))
+    (exp (cast f32 (negate (in 0))))
+    (mul (in 0) (cast f32 (sigmoid (in 0))))
+    (mul (in 0) (cast f32 (mul (in 1) (cast f32 (sigmoid (in 1)))))))
+
+  (define (crunch-fused-bodies)
+    "The f32 bodies of the fused kernels, in the canonical form under which
+    the backends hold them."
+    (map car %crunch-fused-table))
+
+  ;; Installs the fused kernels of %crunch-fused-table in backend be.  Each
+  ;; kernel is (kernel n ins out); its chunks run on up to (threads)
+  ;; threads, with at least (min-chunk) elements each.
+  (define (add-fused-kernels! be threads min-chunk)
+    (for-each
+     (lambda (entry)
+       (let ((n (caddr entry)))
+         (for-each
+          (lambda (dtype body address vec-length dispatch)
+            (call-with-values (lambda () (canonical-scalar-body body))
+              (lambda (canon perm)
+                (unless (equal? canon body)
+                  (error 'add-fused-kernels! "a fused body is not in canonical form" body))))
+            (activation-backend-add-fused-kernel!
+             be body dtype
+             (lambda (size ins out)
+               (unless (and (fixnum? size) (>= size 0) (= (length ins) n)
+                            (<= size (vec-length out))
+                            (let loop ((vs ins))
+                              (or (null? vs) (and (<= size (vec-length (car vs))) (loop (cdr vs))))))
+                 (error 'fused-kernel "inputs or size do not fit the kernel" body size))
+               (let* ((v0 (car ins))
+                      (v1 (if (> n 1) (cadr ins) out))
+                      (v2 (if (> n 2) (caddr ins) out))
+                      (v3 out))
+                 (if (= n 1)
+                     (dispatch size 0 0 0 no-scalars v0 out out out address (threads) (min-chunk))
+                     (if (= n 2)
+                         (dispatch size 0 0 0 no-scalars v0 v1 out out address (threads) (min-chunk))
+                         (dispatch size 0 0 0 no-scalars v0 v1 v2 v3 address (threads) (min-chunk))))))))
+          '(f32 f64)
+          (list (car entry) (cadr entry))
+          (list (cadddr entry) (car (cddddr entry)))
+          (list f32vector-length f64vector-length)
+          (list crunch-dispatch4-f32 crunch-dispatch4-f64))))
+     %crunch-fused-table))
+
+  (define (crunch-colsum-bodies)
+    "The f32 bodies of the fused column-sum kernels, in the canonical form
+    under which the single-threaded backend holds them."
+    (map car %crunch-colsum-table))
+
+  ;; Installs the column-sum kernels of %crunch-colsum-table in backend be,
+  ;; as procedures (kernel rows cols ins mo out).  They run on one thread,
+  ;; because splitting the rows would change the order of the additions.
+  (define (add-colsum-kernels! be)
+    (for-each
+     (lambda (entry)
+       (let ((n (caddr entry)))
+         (for-each
+          (lambda (dtype body kernel vec-length)
+            (call-with-values (lambda () (canonical-scalar-body body))
+              (lambda (canon perm)
+                (unless (equal? canon body)
+                  (error 'add-colsum-kernels! "a column-sum body is not in canonical form" body))))
+            (activation-backend-add-colsum-kernel!
+             be body dtype
+             (lambda (rows cols ins mo out)
+               (unless (and (fixnum? rows) (fixnum? cols) (>= rows 0) (>= cols 0) (= (length ins) n)
+                            (<= (* rows cols) (vec-length mo)) (<= cols (vec-length out))
+                            (let loop ((vs ins))
+                              (or (null? vs) (and (<= (* rows cols) (vec-length (car vs))) (loop (cdr vs))))))
+                 (error 'colsum-kernel "inputs or sizes do not fit the kernel" body rows cols))
+               (let ((v0 (car ins))
+                     (v1 (if (> n 1) (cadr ins) out))
+                     (v2 (if (> n 2) (caddr ins) out)))
+                 (kernel rows cols v0 v1 v2 mo out)))))
+          '(f32 f64)
+          (list (car entry) (cadr entry))
+          (list (cadddr entry) (car (cddddr entry)))
+          (list f32vector-length f64vector-length))))
+     %crunch-colsum-table))
+
   (define (add-extended-kernels! be threads min-chunk)
     (for-each
      (lambda (entry)
@@ -826,6 +1169,28 @@
           (list f32vector-length f64vector-length))))
      %crunch-reduction-table)
     (for-each
+     (lambda (entry)
+       (let ((op (car entry)))
+         (for-each
+          (lambda (dtype acc-kernel elt-kernel vec-length)
+            (activation-backend-add-scan-kernel!
+             be op dtype
+             (lambda (outer n inner src seed out flags)
+               (let ((cells (and (fixnum? outer) (fixnum? n) (fixnum? inner)
+                                 (>= outer 0) (>= n 0) (>= inner 0)
+                                 (* outer n inner))))
+                 (unless (and cells (fixnum? flags) (<= 0 flags 15)
+                              (<= cells (vec-length src)) (<= cells (vec-length out))
+                              (or (< (remainder flags 8) 4)
+                                  (<= (* outer inner) (vec-length seed))))
+                   (error op "scan operands do not fit their vectors" outer n inner flags)))
+               ((if (>= flags 8) elt-kernel acc-kernel) outer n inner src seed out (remainder flags 8)))))
+          '(f32 f64)
+          (list (list-ref entry 1) (list-ref entry 2))
+          (list (list-ref entry 3) (list-ref entry 4))
+          (list f32vector-length f64vector-length))))
+     %crunch-scan-table)
+    (for-each
      (lambda (dtype kernel vec-length)
        (activation-backend-add-copy-kernel! be dtype (checked-copy kernel vec-length)))
      '(f32 f64)
@@ -865,7 +1230,8 @@
     with register-activation-op!.  The backend also holds the binary
     kernels (add, sub, mul, div, whose names it registers with
     register-binary-op!), the axis-0 and axis-1 reduction kernels (sum,
-    mean, max, min) and a strided copy kernel.
+    mean, max, min), a strided copy kernel, and the fused kernels and
+    fused column-sum kernels of define-crunch-fused.
 
     Usage:
       (import array-morphisms-crunch-activations)
@@ -881,6 +1247,8 @@
             be op 'f64 (checked-kernel op (caddr entry) f64vector-length))))
        %crunch-activation-table)
       (add-extended-kernels! be (lambda () 1) crunch-thread-min-chunk)
+      (add-fused-kernels! be (lambda () 1) crunch-thread-min-chunk)
+      (add-colsum-kernels! be)
       be))
 
   (define (crunch-activation-chunk-kernel op dtype)
@@ -899,9 +1267,11 @@
     split each array across threads with crunch-dispatch-f32 and
     crunch-dispatch-f64, and register each op name with
     register-activation-op!.  Its binary kernels are split across threads in
-    the same way; its reduction and copy kernels are those of
-    make-crunch-activation-backend.  Every call uses the values of
-    crunch-thread-count and crunch-thread-min-chunk current at that call.
+    the same way, as are its fused kernels; its reduction and copy kernels
+    are those of make-crunch-activation-backend.  It has no column-sum
+    kernels, whose sums must add the rows in order on one thread.  Every
+    call uses the values of crunch-thread-count and crunch-thread-min-chunk
+    current at that call.
     The results are identical to those of make-crunch-activation-backend.
 
     Usage:
@@ -920,6 +1290,7 @@
             be op 'f64 (lambda (n in out) (crunch-dispatch-f64 n in out chunk-f64)))))
        %crunch-activation-table)
       (add-extended-kernels! be crunch-thread-count crunch-thread-min-chunk)
+      (add-fused-kernels! be crunch-thread-count crunch-thread-min-chunk)
       be))
 
 ) ;; end module array-morphisms-crunch-activations
