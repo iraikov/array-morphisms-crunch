@@ -4,6 +4,8 @@
  ; Your egg's license:
  (license "LGPL-3")
 
+ (version "2.0")
+
  ; Egg category
  (category data)
 
@@ -14,7 +16,7 @@
  ; crunch installs crunch.h where csc may not look for it when
  ; CHICKEN_INSTALL_PREFIX is set; crunch-include.scm finds it and adds
  ; its directory to the C compiler's include path.
- (dependencies crunch array-morphisms)
+ (dependencies crunch (array-morphisms "3.0"))
 
  (author "Ivan Raikov")
 
