@@ -16,7 +16,7 @@ dispatch, boxing or allocation in their inner loops.
 | `array-morphisms-crunch-threads` | the POSIX-thread dispatchers for chunk kernels (`crunch-dispatch-f32`, `crunch-dispatch-f64`, `crunch-dispatch4-f32`, `crunch-dispatch4-f64`, and `crunch-dispatch-n` for generated kernels), their settings, and the persistent worker pool they share |
 | `array-morphisms-crunch-blas-backend` | `crunch-{s,d}gemm`, `-gemm-strided`, `-gemm-offset`, `-gemv`, `-dot`, `-dot-offset`, `-axpy` with the normalized signatures of `array-morphisms-blas-exec`; `crunch-native-build?` |
 | `array-morphisms-crunch-conv-backend` | NCHW/NHWC `im2col`, `col2im`, `bias-add`, the six convolution hooks, and `make-crunch-blas-backend` (the complete `blas-backend` record) |
-| `array-morphisms-crunch-optimizers` | `crunch-adam-f32` and `crunch-adam-f64`, whole-vector Adam updates for nanograd's optimizer-kernel registry |
+| `array-morphisms-crunch-optimizers` | `crunch-adam-f32`, `crunch-adam-f64`, `crunch-adamw-f32` and `crunch-adamw-f64`, whole-vector Adam and AdamW updates for nanograd's optimizer-kernel registry |
 | `array-morphisms-crunch-codegen` | a segop backend that generates, compiles and runs a kernel for each segop of a replay plan (see Code generation) |
 | `array-morphisms-crunch-translate` | the translation of segop bodies into crunch Scheme, shared by the generated kernels |
 
@@ -43,13 +43,23 @@ The two registrations are independent. The activation backend can be
 combined with any BLAS backend, including microBLAS and the system-BLAS
 backend of `array-morphisms-blas`.
 
-nanograd's Adam optimizer uses the Adam kernel once it is registered:
+nanograd's Adam optimizer uses the Adam kernel once it is registered,
+and its AdamW optimizer (Adam with decoupled weight decay) uses the
+AdamW kernel:
 
 ```scheme
 (import nanograd-optimizer array-morphisms-crunch-optimizers)
 (register-optimizer-kernel! 'adam 'f32 crunch-adam-f32)
 (register-optimizer-kernel! 'adam 'f64 crunch-adam-f64)
+(register-optimizer-kernel! 'adamw 'f32 crunch-adamw-f32)
+(register-optimizer-kernel! 'adamw 'f64 crunch-adamw-f64)
 ```
+
+The AdamW kernel takes the same hyperparameter vector as the Adam
+kernel; its weight decay scales the parameter by `1 - lr * wd` instead
+of being added to the gradient. Without an `adamw` registration, nanograd's
+AdamW applies the decay itself and then calls the `adam` kernel with a
+weight decay of 0.
 
 ## Building
 

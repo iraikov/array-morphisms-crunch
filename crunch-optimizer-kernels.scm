@@ -21,6 +21,12 @@
 ;;;   4. subtracts lr * m' / (sqrt(v') + eps) from the parameter, where m'
 ;;;      and v' are m and v divided by their bias corrections.
 ;;;
+;;; crunch-adamw-f32 and crunch-adamw-f64 perform one AdamW update (Adam
+;;; with decoupled weight decay) with the same arguments.  In place of
+;;; step 1 they scale the parameter, param := (1 - lr * wd) * param, when
+;;; the weight decay is positive, and leave the gradient unchanged; steps
+;;; 2 to 4 are those of Adam.
+;;;
 ;;; Each step is computed in double precision and stored in the vector it
 ;;; updates, which is the order of operations of the Scheme optimizer.
 ;;; The elements are shared among up to (crunch-thread-count) threads;
@@ -30,11 +36,15 @@
 ;;;   (import array-morphisms-crunch-optimizers nanograd-optimizer)
 ;;;   (register-optimizer-kernel! 'adam 'f32 crunch-adam-f32)
 ;;;   (register-optimizer-kernel! 'adam 'f64 crunch-adam-f64)
+;;;   (register-optimizer-kernel! 'adamw 'f32 crunch-adamw-f32)
+;;;   (register-optimizer-kernel! 'adamw 'f64 crunch-adamw-f64)
 
 (module array-morphisms-crunch-optimizers
 
   (crunch-adam-f32
-   crunch-adam-f64)
+   crunch-adam-f64
+   crunch-adamw-f32
+   crunch-adamw-f64)
 
   (import scheme (chicken base) (chicken foreign) (chicken number-vector) crunch)
   (import (only array-morphisms-crunch-threads
@@ -44,18 +54,27 @@
 
   (include "crunch-numvector-fix.scm")
 
-  ;; am_crunch_adam_<t> updates elements [start, end) as described above.
-  ;; It follows the calling convention of crunch-dispatch4-f32/-f64 (i0-i2
-  ;; are not used), with hyper as the scalar vector and param, grad, m and
-  ;; v as the four vectors.
+  ;; (define-crunch-adam <t> <kind>) defines am_crunch_<kind>_<t>, which
+  ;; updates elements [start, end) as described above; <kind> is adam
+  ;; (weight decay added to the gradient) or adamw (decoupled weight
+  ;; decay).  The kernel follows the calling convention of
+  ;; crunch-dispatch4-f32/-f64 (i0-i2 are not used), with hyper as the
+  ;; scalar vector and param, grad, m and v as the four vectors.
   (define-syntax define-crunch-adam
     (er-macro-transformer
      (lambda (form r c)
        (let* ((dtype (cadr form))
-              (name  (string->symbol (string-append "am_crunch_adam_" (symbol->string dtype))))
+              (kind  (caddr form))
+              (name  (string->symbol (string-append "am_crunch_" (symbol->string kind)
+                                                    "_" (symbol->string dtype))))
               (vec   (if (eq? dtype 'f32) 'f32vector 'f64vector))
               (ref   (if (eq? dtype 'f32) 'f32vector-ref 'f64vector-ref))
-              (set   (if (eq? dtype 'f32) 'f32vector-set! 'f64vector-set!)))
+              (set   (if (eq? dtype 'f32) 'f32vector-set! 'f64vector-set!))
+              (decay (if (eq? kind 'adamw)
+                         `(if (> wd 0.0)
+                              (,set param i (* (- 1.0 (* lr wd)) (,ref param i))))
+                         `(if (> wd 0.0)
+                              (,set grad i (+ (,ref grad i) (* wd (,ref param i))))))))
          `(,(r 'crunch)
            (: (,name integer integer integer integer integer
                      f64vector ,vec ,vec ,vec ,vec) void)
@@ -68,8 +87,7 @@
                    (bc2 (f64vector-ref hyper 5))
                    (wd  (f64vector-ref hyper 6)))
                (do ((i start (+ i 1))) ((= i end))
-                 (if (> wd 0.0)
-                     (,set grad i (+ (,ref grad i) (* wd (,ref param i)))))
+                 ,decay
                  (let ((g (,ref grad i)))
                    (,set m i (* b1 (,ref m i)))
                    (,set m i (+ (,ref m i) (* (- 1.0 b1) g)))
@@ -80,11 +98,15 @@
                      (,set param i (- (,ref param i)
                                       (/ (* lr m-hat) (+ (sqrt v-hat) eps))))))))))))))
 
-  (define-crunch-adam f32)
-  (define-crunch-adam f64)
+  (define-crunch-adam f32 adam)
+  (define-crunch-adam f64 adam)
+  (define-crunch-adam f32 adamw)
+  (define-crunch-adam f64 adamw)
 
   (define adam-f32 (foreign-value "((void *)&am_crunch_adam_f32)" c-pointer))
   (define adam-f64 (foreign-value "((void *)&am_crunch_adam_f64)" c-pointer))
+  (define adamw-f32 (foreign-value "((void *)&am_crunch_adamw_f32)" c-pointer))
+  (define adamw-f64 (foreign-value "((void *)&am_crunch_adamw_f64)" c-pointer))
 
   (define (adam who kernel dispatch vec-length n hyper param grad m v)
     (unless (and (f64vector? hyper) (>= (f64vector-length hyper) 7))
@@ -105,6 +127,18 @@
   (define (crunch-adam-f64 n hyper param grad m v)
     "f64 counterpart of crunch-adam-f32."
     (adam 'crunch-adam-f64 adam-f64 crunch-dispatch4-f64 f64vector-length
+          n hyper param grad m v))
+
+  (define (crunch-adamw-f32 n hyper param grad m v)
+    "AdamW update (decoupled weight decay) of the first n elements of the
+    f32vectors param, m and v, with the gradient grad and the
+    hyperparameters in the f64vector hyper.  grad is not modified."
+    (adam 'crunch-adamw-f32 adamw-f32 crunch-dispatch4-f32 f32vector-length
+          n hyper param grad m v))
+
+  (define (crunch-adamw-f64 n hyper param grad m v)
+    "f64 counterpart of crunch-adamw-f32."
+    (adam 'crunch-adamw-f64 adamw-f64 crunch-dispatch4-f64 f64vector-length
           n hyper param grad m v))
 
 ) ;; end module array-morphisms-crunch-optimizers
