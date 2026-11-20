@@ -109,8 +109,8 @@
   ;;;     give 1.0 or 0.0;
   ;;;   - the arithmetic primitives +, -, *, /, expt, fpabs and the
   ;;;     transcendental functions compute as the table ops of the same
-  ;;;     meaning, and (%gadd a b) is Scheme's generic +, which differs from
-  ;;;     add only in giving 0.0 for -0.0 + -0.0.
+  ;;;     meaning, and (%gadd a b) is Scheme's generic +, which adds two
+  ;;;     flonums as add does, with the IEEE sign of zero.
   ;;;
   ;;; Scheme integers have no bound, so an integer result that does not fit
   ;;; in 64 bits, a store of a value that does not fit its output dtype, and
@@ -225,7 +225,7 @@
               (let ((a (tr (cadr e))) (b (tr (caddr e))))
                 (cond ((all-int? (list a b)) (bind! `(,(checked! 'addi) ,(car a) ,(car b)) 'i))
                       ((and (eq? (cdr a) 'f) (eq? (cdr b) 'f))
-                       (bind! `(+ (+ ,(car a) ,(car b)) 0.0) 'f))
+                       (bind! `(+ ,(car a) ,(car b)) 'f))
                       (else (bind! `(+ ,(to-float a) ,(to-float b)) 'f)))))
              ((fpabs)
               (unless (= (length e) 2) (fail))
@@ -343,9 +343,9 @@
     (form . type), with combine op op (add, mul, max or min), and rounding
     the result to the accumulator dtype acc-dt, as one step of a reduction
     of array-morphisms does; and whether it can set the failure flag, as
-    two values.  Two flonums are added with generic Scheme addition, which
-    gives 0.0 for -0.0 + -0.0, as the IEEE sum plus 0.0 does; max and min
-    replace the accumulator only by a greater or a smaller value."
+    two values.  Two flonums are added with the IEEE sum, as generic
+    Scheme addition adds them; max and min replace the accumulator only by
+    a greater or a smaller value."
     (let* ((fails? #f)
            (checked (lambda (name) (set! fails? #t) (helper name)))
            (fl (lambda (a) (if (eq? (cdr a) 'f) (car a) `(,(helper 'i2f) ,(car a)))))
@@ -358,7 +358,7 @@
              (case op
                ((add) (rounded (if both-int?
                                    (cons `(,(checked 'addi) ,(car acc) ,(car v)) 'i)
-                                   (cons `(+ (+ ,(fl acc) ,(fl v)) 0.0) 'f))))
+                                   (cons `(+ ,(fl acc) ,(fl v)) 'f))))
                ((mul) (rounded (if both-int?
                                    (cons `(,(checked 'muli) ,(car acc) ,(car v)) 'i)
                                    (cons `(* ,(fl acc) ,(fl v)) 'f))))

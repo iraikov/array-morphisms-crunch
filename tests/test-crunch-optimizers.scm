@@ -1,5 +1,5 @@
 ;;; tests/test-crunch-optimizers.scm
-;;; Tests for the Adam kernels of array-morphisms-crunch-optimizers.
+;;; Tests for the Adam and AdamW kernels of array-morphisms-crunch-optimizers.
 ;;;
 ;;; The reference below performs the kernel's documented steps in Scheme,
 ;;; storing each intermediate result in its vector as the kernel does.  In
@@ -33,6 +33,20 @@
         (wd (f64vector-ref hyper 6)))
     (do ((i 0 (+ i 1))) ((= i n))
       (when (> wd 0.0) (vset! grad i (+ (vref grad i) (* wd (vref param i)))))
+      (let ((g (vref grad i)))
+        (vset! m i (* b1 (vref m i)))
+        (vset! m i (+ (vref m i) (* (- 1.0 b1) g)))
+        (vset! v i (* b2 (vref v i)))
+        (vset! v i (+ (vref v i) (* (* (- 1.0 b2) g) g)))
+        (let ((m-hat (/ (vref m i) bc1)) (v-hat (/ (vref v i) bc2)))
+          (vset! param i (- (vref param i) (/ (* lr m-hat) (+ (sqrt v-hat) eps)))))))))
+
+(define (reference-adamw! n hyper param grad m v)
+  (let ((lr (f64vector-ref hyper 0)) (b1 (f64vector-ref hyper 1)) (b2 (f64vector-ref hyper 2))
+        (eps (f64vector-ref hyper 3)) (bc1 (f64vector-ref hyper 4)) (bc2 (f64vector-ref hyper 5))
+        (wd (f64vector-ref hyper 6)))
+    (do ((i 0 (+ i 1))) ((= i n))
+      (when (> wd 0.0) (vset! param i (* (- 1.0 (* lr wd)) (vref param i))))
       (let ((g (vref grad i)))
         (vset! m i (* b1 (vref m i)))
         (vset! m i (+ (vref m i) (* (- 1.0 b1) g)))
@@ -86,5 +100,50 @@
   (test-error "Adam rejects a short hyperparameter vector"
     (crunch-adam-f32 1 (f64vector 0.1) (make-f32vector 1) (make-f32vector 1)
                      (make-f32vector 1) (make-f32vector 1))))
+
+(test-group "crunch AdamW kernels"
+  (for-each
+   (lambda (dtype make kernel tol)
+     (for-each
+      (lambda (wd)
+        (test-assert (sprintf "~A AdamW matches the reference over five steps, weight decay ~A" dtype wd)
+          (lists-match? (five-steps kernel make 1000 wd)
+                        (five-steps reference-adamw! make 1000 wd)
+                        tol))
+        (test-assert (sprintf "~A AdamW gives identical results for 1, 3 and 8 threads, weight decay ~A" dtype wd)
+          (let ((run (lambda (threads)
+                       (parameterize ((crunch-thread-count threads) (crunch-thread-min-chunk 1000))
+                         (five-steps kernel make 20001 wd)))))
+            (let ((one (run 1)))
+              (every (lambda (t) (equal? one (run t))) '(3 8))))))
+      '(0.0 0.01 1.0))
+     (test-assert (sprintf "~A AdamW leaves the gradient unchanged" dtype)
+       (let ((grad (make-vec make 100 (lambda (i) (cos (* 0.3 i))))))
+         (let ((before (vlist grad)))
+           (kernel 100 (hyper-for 1 0.5) (make-vec make 100 (lambda (i) (sin (* 0.2 i))))
+                   grad (make 100 0.0) (make 100 0.0))
+           (equal? before (vlist grad)))))
+     (test-assert (sprintf "~A AdamW with zero gradient scales the parameter by 1 - lr * wd" dtype)
+       (let ((param (make-vec make 10 (lambda (i) (- i 4.5)))))
+         (kernel 10 (hyper-for 1 2.0) param (make 10 0.0) (make 10 0.0) (make 10 0.0))
+         (every (lambda (i)
+                  (<= (abs (- (vref param i) (* (- 1.0 (* 0.001 2.0)) (- i 4.5)))) (* tol 10.0)))
+                (iota 10)))))
+   '(f32 f64)
+   (list make-f32vector make-f64vector)
+   (list crunch-adamw-f32 crunch-adamw-f64)
+   '(1e-6 1e-12))
+  (test-assert "AdamW and Adam agree when the weight decay is 0"
+    (equal? (five-steps crunch-adamw-f64 make-f64vector 1000 0.0)
+            (five-steps crunch-adam-f64 make-f64vector 1000 0.0)))
+  (test-assert "AdamW and Adam differ when the weight decay is positive"
+    (not (equal? (five-steps crunch-adamw-f64 make-f64vector 1000 0.01)
+                 (five-steps crunch-adam-f64 make-f64vector 1000 0.01))))
+  (test-error "AdamW rejects a size beyond its vectors"
+    (crunch-adamw-f64 10 (hyper-for 1 0.0) (make-f64vector 10) (make-f64vector 10)
+                      (make-f64vector 3) (make-f64vector 10)))
+  (test-error "AdamW rejects a short hyperparameter vector"
+    (crunch-adamw-f64 1 (f64vector 0.1) (make-f64vector 1) (make-f64vector 1)
+                      (make-f64vector 1) (make-f64vector 1))))
 
 (test-exit)
